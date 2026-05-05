@@ -35,8 +35,10 @@ from PySide6.QtWidgets import (
     QGroupBox, QSizePolicy, QLineEdit,
     QCheckBox, QGraphicsView, QGraphicsScene, QToolBar,
 )
-from PySide6.QtCore import Qt, QUrl, QPointF, QRectF, QProcess, QTimer
+from PySide6.QtCore import Qt, QUrl, QPointF, QRectF, QProcess, QTimer, QSizeF
 from PySide6.QtGui import QFont, QTransform, QPolygonF
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import (
     QWebEngineSettings, QWebEngineProfile, QWebEnginePage,
@@ -59,7 +61,15 @@ def make_graphics_view(scene: QGraphicsScene) -> QGraphicsView:
     return view
 
 
-def compute_view_transform(view: QGraphicsView, scene_rect: QRectF, keystone: int) -> QTransform:
+def compute_view_transform(
+    view: QGraphicsView,
+    scene_rect: QRectF,
+    keystone: int,
+    aspect: int = 0,
+) -> QTransform:
+    """
+    aspect: -50 ~ +50, 0이면 1.0배. 음수는 좌우 압축, 양수는 좌우 늘림.
+    """
     vw = view.viewport().width()
     vh = view.viewport().height()
     sw = scene_rect.width()
@@ -68,30 +78,41 @@ def compute_view_transform(view: QGraphicsView, scene_rect: QRectF, keystone: in
         return QTransform()
 
     scale = min(vw / sw, vh / sh)
-    ox = (vw - sw * scale) / 2
-    oy = (vh - sh * scale) / 2
+    # 가로 비율 보정: -50 ~ +50 → 0.7 ~ 1.3 배율
+    h_scale = 1.0 + aspect / 100.0 * 0.6
+    scaled_w = sw * scale * h_scale
+    scaled_h = sh * scale
+    ox = (vw - scaled_w) / 2
+    oy = (vh - scaled_h) / 2
 
     fit = QTransform()
     fit.translate(ox, oy)
-    fit.scale(scale, scale)
+    fit.scale(scale * h_scale, scale)
 
     if keystone == 0:
         return fit
 
+    # 키스톤은 늘려진 영역 기준
     offset = abs(keystone) / 100.0 * vh * 0.25
+    x_left = ox
+    x_right = ox + scaled_w
+    y_top = oy
+    y_bot = oy + scaled_h
+
+    # 현재 fit 변환 후의 사각형 → 키스톤 적용된 사각형
     src = QPolygonF([
-        QPointF(0, 0), QPointF(vw, 0),
-        QPointF(vw, vh), QPointF(0, vh),
+        QPointF(x_left, y_top), QPointF(x_right, y_top),
+        QPointF(x_right, y_bot), QPointF(x_left, y_bot),
     ])
     if keystone > 0:
         dst = QPolygonF([
-            QPointF(0, 0), QPointF(vw, offset),
-            QPointF(vw, vh - offset), QPointF(0, vh),
+            QPointF(x_left, y_top), QPointF(x_right, y_top + offset),
+            QPointF(x_right, y_bot), QPointF(x_left, y_bot - offset),
         ])
     else:
         dst = QPolygonF([
-            QPointF(0, offset), QPointF(vw, 0),
-            QPointF(vw, vh), QPointF(0, vh - offset),
+            QPointF(x_left, y_top + offset), QPointF(x_right, y_top),
+            QPointF(x_right, y_bot - offset), QPointF(x_left, y_bot),
         ])
     ks = QTransform()
     QTransform.quadToQuad(src, dst, ks)
@@ -137,11 +158,22 @@ class ProjectorWindow(QMainWindow):
 
         self.web_view.setFixedSize(LOGICAL_W, LOGICAL_H)
         self.proxy_widget = self.scene.addWidget(self.web_view)
-        # 처음엔 숨김
         self.proxy_widget.setVisible(False)
 
+        # 영상 - 한 번만 생성, 재사용
+        self.video_item = QGraphicsVideoItem()
+        self.video_item.setSize(QSizeF(LOGICAL_W, LOGICAL_H))
+        self.scene.addItem(self.video_item)
+        self.video_item.setVisible(False)
+
+        self.audio = QAudioOutput()
+        self.player = QMediaPlayer()
+        self.player.setAudioOutput(self.audio)
+        self.player.setVideoOutput(self.video_item)
+
         self._keystone_value = 0
-        self._content_mode = None  # "browser" or None (mpv는 별도 창)
+        self._aspect_value = 0
+        self._content_mode = None  # "browser" / "video" / None
 
         # 프로젝터 출력 (복제 창)
         self.output_window: QMainWindow | None = None
@@ -168,8 +200,37 @@ class ProjectorWindow(QMainWindow):
         self.output_btn.toggled.connect(self._toggle_output)
         toolbar.addWidget(self.output_btn)
 
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel(" 🔊 "))
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setFixedWidth(120)
+        self.volume_slider.valueChanged.connect(self._on_volume_changed)
+        toolbar.addWidget(self.volume_slider)
+        self.volume_label = QLabel("100%")
+        self.volume_label.setFixedWidth(45)
+        toolbar.addWidget(self.volume_label)
+
         self.addToolBar(toolbar)
         self._refresh_screens()
+
+    on_volume_changed = None  # KeystonePlayer가 설정 저장용으로 사용
+
+    def set_volume(self, value: int):
+        """볼륨 설정 (0-100). 시그널 발생 안 시킴."""
+        self.volume_slider.blockSignals(True)
+        self.volume_slider.setValue(value)
+        self.volume_slider.blockSignals(False)
+        self._apply_volume(value)
+
+    def _on_volume_changed(self, value: int):
+        self._apply_volume(value)
+        if self.on_volume_changed:
+            self.on_volume_changed(value)
+
+    def _apply_volume(self, value: int):
+        self.audio.setVolume(value / 100.0)
+        self.volume_label.setText(f"{value}%")
 
     def _refresh_screens(self):
         self.screen_combo.clear()
@@ -224,19 +285,97 @@ class ProjectorWindow(QMainWindow):
         self.output_btn.setText("프로젝터 출력")
         self.screen_combo.setEnabled(True)
 
+    # ---- 화면보호기 ----
+
+    _inhibit_cookie: int | None = None
+
+    def _inhibit_screensaver(self):
+        if self._inhibit_cookie is not None:
+            return
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["qdbus", "org.freedesktop.ScreenSaver",
+                 "/org/freedesktop/ScreenSaver",
+                 "org.freedesktop.ScreenSaver.Inhibit",
+                 "Keystone Player", "Playing content"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if result.returncode == 0:
+                self._inhibit_cookie = int(result.stdout.strip())
+        except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
+            pass
+
+    def _uninhibit_screensaver(self):
+        if self._inhibit_cookie is None:
+            return
+        try:
+            import subprocess
+            subprocess.run(
+                ["qdbus", "org.freedesktop.ScreenSaver",
+                 "/org/freedesktop/ScreenSaver",
+                 "org.freedesktop.ScreenSaver.UnInhibit",
+                 str(self._inhibit_cookie)],
+                capture_output=True, timeout=2,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        self._inhibit_cookie = None
+
     # ---- 콘텐츠 ----
 
     def show_browser(self, url: str):
         """브라우저 표시 (재생성 없이 URL만 변경)"""
+        self._stop_video()
         self._content_mode = "browser"
+        self.video_item.setVisible(False)
         self.proxy_widget.setVisible(True)
         self.web_view.load(QUrl(url))
+        self._inhibit_screensaver()
         self._update_all_transforms()
 
-    def hide_content(self):
-        """콘텐츠 숨기기 (브라우저는 파괴하지 않고 숨김)"""
+    def show_video(self, file_path: str):
+        """영상 재생 (재생성 없이 source만 변경)"""
+        self._content_mode = "video"
         self.proxy_widget.setVisible(False)
         self.web_view.load(QUrl("about:blank"))
+        self.video_item.setVisible(True)
+        self.player.setSource(QUrl.fromLocalFile(file_path))
+        self.player.play()
+        self._inhibit_screensaver()
+        self._update_all_transforms()
+
+    def play_video(self):
+        if self._content_mode == "video":
+            self.player.play()
+
+    def pause_video(self):
+        if self._content_mode == "video":
+            self.player.pause()
+
+    def is_video_playing(self) -> bool:
+        return (
+            self._content_mode == "video"
+            and self.player.playbackState() == QMediaPlayer.PlayingState
+        )
+
+    def is_video_paused(self) -> bool:
+        return (
+            self._content_mode == "video"
+            and self.player.playbackState() == QMediaPlayer.PausedState
+        )
+
+    def _stop_video(self):
+        if self.player.playbackState() != QMediaPlayer.StoppedState:
+            self.player.stop()
+
+    def hide_content(self):
+        """콘텐츠 숨기기 (재생성 없이 숨김만)"""
+        self._stop_video()
+        self.video_item.setVisible(False)
+        self.proxy_widget.setVisible(False)
+        self.web_view.load(QUrl("about:blank"))
+        self._uninhibit_screensaver()
         self._content_mode = None
 
     # ---- 키스톤 ----
@@ -245,13 +384,18 @@ class ProjectorWindow(QMainWindow):
         self._keystone_value = value
         self._update_all_transforms()
 
+    def set_aspect(self, value: int):
+        self._aspect_value = value
+        self._update_all_transforms()
+
     def _update_all_transforms(self):
         scene_rect = self.scene.sceneRect()
         k = self._keystone_value
-        self.view.setTransform(compute_view_transform(self.view, scene_rect, k))
+        a = self._aspect_value
+        self.view.setTransform(compute_view_transform(self.view, scene_rect, k, a))
         if self.output_view:
             self.output_view.setTransform(
-                compute_view_transform(self.output_view, scene_rect, k)
+                compute_view_transform(self.output_view, scene_rect, k, a)
             )
 
     def resizeEvent(self, event):
@@ -275,6 +419,8 @@ class KeystonePlayer(QMainWindow):
         self.current_file = ""
         self._settings = load_settings()
         self.keystone_value = self._settings.get("keystone", 0)
+        self.volume_value = self._settings.get("volume", 100)
+        self.aspect_value = self._settings.get("aspect", 0)
         self.projector_window: ProjectorWindow | None = None
         self.playback_mode = "file"  # "file" or "browser"
 
@@ -388,6 +534,28 @@ class KeystonePlayer(QMainWindow):
 
         layout.addWidget(ks_group)
 
+        # --- 좌우 비율 ---
+        aspect_group = QGroupBox("좌우 비율")
+        aspect_layout = QHBoxLayout(aspect_group)
+        aspect_layout.addWidget(QLabel("⇤"))
+        self.aspect_slider = QSlider(Qt.Horizontal)
+        self.aspect_slider.setRange(-50, 50)
+        self.aspect_slider.setValue(self.aspect_value)
+        self.aspect_slider.setTickPosition(QSlider.TicksBelow)
+        self.aspect_slider.setTickInterval(10)
+        self.aspect_slider.valueChanged.connect(self._on_aspect_changed)
+        aspect_layout.addWidget(self.aspect_slider)
+        aspect_layout.addWidget(QLabel("⇥"))
+        self.aspect_value_label = QLabel(str(self.aspect_value))
+        self.aspect_value_label.setFixedWidth(40)
+        self.aspect_value_label.setAlignment(Qt.AlignCenter)
+        aspect_layout.addWidget(self.aspect_value_label)
+        btn_aspect_reset = QPushButton("초기화")
+        btn_aspect_reset.setFixedWidth(80)
+        btn_aspect_reset.clicked.connect(lambda: self.aspect_slider.setValue(0))
+        aspect_layout.addWidget(btn_aspect_reset)
+        layout.addWidget(aspect_group)
+
         # --- 재생 컨트롤 ---
         ctrl_group = QGroupBox("재생")
         ctrl_layout = QHBoxLayout(ctrl_group)
@@ -456,13 +624,29 @@ class KeystonePlayer(QMainWindow):
         if self.projector_window is None:
             self.projector_window = ProjectorWindow()
             self.projector_window.on_closed = self._on_emulator_window_closed
+            self.projector_window.on_volume_changed = self._on_volume_changed
+            self.projector_window.set_volume(self.volume_value)
 
         pw = self.projector_window
         pw.set_keystone(self.keystone_value)
+        pw.set_aspect(self.aspect_value)
         if not pw.isVisible():
             pw.resize(960, 540)
             pw.show()
         return pw
+
+    def _on_volume_changed(self, value: int):
+        self.volume_value = value
+        self._settings["volume"] = value
+        save_settings(self._settings)
+
+    def _on_aspect_changed(self, value: int):
+        self.aspect_value = value
+        self.aspect_value_label.setText(str(value))
+        self._settings["aspect"] = value
+        save_settings(self._settings)
+        if self.projector_window:
+            self.projector_window.set_aspect(value)
 
     # ---- 키스톤 ----
 
@@ -473,13 +657,13 @@ class KeystonePlayer(QMainWindow):
         if k > 0:
             x0, y0 = 0, 0
             x1, y1 = w, offset
-            x2, y2 = 0, h
-            x3, y3 = w, h - offset
+            x2, y2 = 0, h - offset
+            x3, y3 = w, h
         else:
             x0, y0 = 0, offset
             x1, y1 = w, 0
-            x2, y2 = 0, h - offset
-            x3, y3 = w, h
+            x2, y2 = 0, h
+            x3, y3 = w, h - offset
         return f"perspective={x0}:{y0}:{x1}:{y1}:{x2}:{y2}:{x3}:{y3}:cubic"
 
     def _on_keystone_changed(self, value: int):
@@ -516,25 +700,9 @@ class KeystonePlayer(QMainWindow):
             return
 
         self._stop_mpv()
-
-        args = [
-            "mpv",
-            "--input-ipc-server=" + self.ipc_path,
-            "--geometry=960x540",
-            "--keep-open=yes",
-            "--osd-level=0",
-            f"--title=Keystone Player - {os.path.basename(self.current_file)}",
-        ]
-
-        vf = self._calc_perspective_filter(self.keystone_value, 1920, 1080)
-        if vf:
-            args.append(f"--vf=lavfi=[{vf}]")
-
-        args.append(self.current_file)
-
-        self.mpv_process = QProcess(self)
-        self.mpv_process.finished.connect(self._on_mpv_finished)
-        self.mpv_process.start(args[0], args[1:])
+        self.emulator_check.setChecked(True)
+        pw = self._ensure_projector_window()
+        pw.show_video(self.current_file)
         self.is_paused = False
         self.status_label.setText(f"재생 중: {os.path.basename(self.current_file)}")
 
@@ -553,14 +721,15 @@ class KeystonePlayer(QMainWindow):
         self.status_label.setText(f"브라우저: {url}")
 
     def _toggle_pause(self):
-        if self.playback_mode == "file":
-            if self.mpv_process and self.mpv_process.state() == QProcess.Running:
-                self._send_mpv_command(["cycle", "pause"])
-                self.is_paused = not self.is_paused
-                if self.is_paused:
-                    self.status_label.setText("일시정지")
-                else:
-                    self.status_label.setText(f"재생 중: {os.path.basename(self.current_file)}")
+        if self.playback_mode != "file" or not self.projector_window:
+            return
+        pw = self.projector_window
+        if pw.is_video_playing():
+            pw.pause_video()
+            self.status_label.setText("일시정지")
+        elif pw.is_video_paused():
+            pw.play_video()
+            self.status_label.setText(f"재생 중: {os.path.basename(self.current_file)}")
 
     def _stop(self):
         self._stop_mpv()
