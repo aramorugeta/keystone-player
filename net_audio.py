@@ -16,8 +16,12 @@
 프로토콜 상세는 android/PROMPT.md 참고.
 """
 
+import csv
 import json
+import os
+import time
 from collections import deque
+from datetime import datetime
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtNetwork import QHostAddress, QTcpServer
@@ -36,6 +40,17 @@ PING_INTERVAL_MS = 2000
 # 왕복 시간은 최근 여러 번 중 최솟값을 쓴다. 폰의 스케줄링 지터가 섞인 값 대신
 # 순수 전파 지연에 가장 가까운 값을 골라야 립싱크 보정이 안정적이다.
 RTT_WINDOW = 8
+# 같은 공유기 안에서 이보다 오래 걸릴 리 없다. 넘으면 폰이 응답을 늦게 처리한
+# 것이므로 전파 지연의 근거가 못 된다 — 버리지 않으면 립싱크가 그만큼 튄다.
+RTT_MAX_MS = 200
+
+# 폰이 보고하는 값을 기록해두는 파일. 긴 재생에서 클럭 드리프트가 있는지
+# (버퍼가 한쪽으로 계속 밀리는지) 확인하는 용도다. tools/latency_report.py 로 본다.
+LOG_NAME = "latency-log.csv"
+LOG_COLUMNS = [
+    "time", "session", "elapsed_s",
+    "output_ms", "buffer_ms", "rtt_ms", "one_way_ms", "pc_ms", "offset_ms", "total_ms",
+]
 
 
 class ControlServer(QObject):
@@ -44,6 +59,7 @@ class ControlServer(QObject):
     connected = Signal(str)          # 폰 IP
     disconnected = Signal()
     latencyReported = Signal(int)    # 총 지연 ms (영상을 이만큼 늦추면 된다)
+    trimRequested = Signal(int)      # 폰에서 직접 조절한 수동 보정값
     statusChanged = Signal(str)      # UI 표시용 한 줄
 
     def __init__(self, parent=None):
@@ -59,6 +75,12 @@ class ControlServer(QObject):
         # 남는 오차를 사용자가 직접 맞추는 값
         self._offset_ms = 0
         self._last_report: tuple[int, int] | None = None
+
+        self._log_dir: str | None = None
+        self._log_file = None
+        self._log_writer = None
+        self._session = ""
+        self._session_start = 0.0
 
         self._ping_timer = QTimer(self)
         self._ping_timer.timeout.connect(self._send_ping)
@@ -108,9 +130,13 @@ class ControlServer(QObject):
         socket.disconnected.connect(self._on_disconnected)
 
         ip = self.peer_ip()
+        self._session = datetime.now().isoformat(timespec="seconds")
+        self._session_start = time.monotonic()
+        self._open_log()
         self._send({
             "type": "hello",
             "protocol": PROTOCOL_VERSION,
+            "trim_ms": self._offset_ms,
             "audio": {
                 "transport": "rtp",
                 "port": AUDIO_PORT,
@@ -126,6 +152,8 @@ class ControlServer(QObject):
 
     def _on_disconnected(self):
         self._ping_timer.stop()
+        self._close_log()
+        self._last_report = None
         self._socket = None
         self._device = ""
         self._rtt_ms = 0
@@ -157,7 +185,9 @@ class ControlServer(QObject):
         elif kind == "pong":
             sent = msg.get("t")
             if isinstance(sent, (int, float)):
-                self._rtts.append(max(0, int(self._now_ms() - sent)))
+                rtt = max(0, int(self._now_ms() - sent))
+                if rtt <= RTT_MAX_MS:
+                    self._rtts.append(rtt)
 
         elif kind == "latency":
             output = self._as_int(msg.get("output_ms"))
@@ -165,11 +195,68 @@ class ControlServer(QObject):
             if output is None or buffer_ms is None:
                 return
             self._last_report = (output, buffer_ms)
-            self._publish()
+            self._publish(log=True)
+
+        elif kind == "trim":
+            # 소파에서 폰으로 직접 맞출 수 있게 한다. PC 앞까지 갈 필요가 없다.
+            value = msg.get("offset_ms")
+            if isinstance(value, (int, float)):
+                self.trimRequested.emit(int(value))
 
         elif kind == "bye":
             if self._socket is not None:
                 self._socket.disconnectFromHost()
+
+    # ---- 기록 ----
+
+    def set_log_dir(self, path: str):
+        self._log_dir = path
+
+    def log_path(self) -> str | None:
+        if self._log_dir is None:
+            return None
+        return os.path.join(self._log_dir, LOG_NAME)
+
+    def _open_log(self):
+        path = self.log_path()
+        if path is None:
+            return
+        try:
+            os.makedirs(self._log_dir, exist_ok=True)
+            is_new = not os.path.exists(path) or os.path.getsize(path) == 0
+            self._log_file = open(path, "a", newline="")
+            self._log_writer = csv.writer(self._log_file)
+            if is_new:
+                self._log_writer.writerow(LOG_COLUMNS)
+        except OSError:
+            self._log_file = None
+            self._log_writer = None
+
+    def _close_log(self):
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+        self._log_file = None
+        self._log_writer = None
+
+    def _log_row(self, output, buffer_ms, rtt, one_way, total):
+        if self._log_writer is None:
+            return
+        try:
+            self._log_writer.writerow([
+                datetime.now().isoformat(timespec="seconds"),
+                self._session,
+                round(time.monotonic() - self._session_start, 1),
+                output, buffer_ms, rtt, one_way, self._pc_latency_ms,
+                self._offset_ms, total,
+            ])
+            self._log_file.flush()
+        except (OSError, ValueError):
+            self._close_log()
+
+    # ---- 지연 계산 ----
 
     def set_pc_latency(self, ms: int):
         """PC 쪽 송출 버퍼 등 폰이 알 수 없는 지연."""
@@ -181,14 +268,17 @@ class ControlServer(QObject):
         self._offset_ms = int(ms)
         self._publish()
 
-    def _publish(self):
+    def _publish(self, log: bool = False):
         """지금까지 아는 값으로 총 지연을 다시 계산해서 알린다."""
         if self._last_report is None:
             return
         output, buffer_ms = self._last_report
-        one_way = (min(self._rtts) // 2) if self._rtts else 0
+        rtt = min(self._rtts) if self._rtts else 0
+        one_way = rtt // 2
         total = max(0, output + buffer_ms + one_way + self._pc_latency_ms + self._offset_ms)
         self.latencyReported.emit(total)
+        if log:
+            self._log_row(output, buffer_ms, rtt, one_way, total)
         name = self._device or self.peer_ip()
         offset_text = f" {self._offset_ms:+d}ms 보정" if self._offset_ms else ""
         self.statusChanged.emit(

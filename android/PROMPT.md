@@ -77,12 +77,15 @@ PC → 앱:
 {"type":"ready","device":"Galaxy Z Fold7","app":"1.0"}
 {"type":"pong","t":1234567}
 {"type":"latency","output_ms":42,"buffer_ms":80}
+{"type":"trim","offset_ms":40}
 {"type":"bye"}
 ```
 
 - `ready` — 접속 직후 한 번. `device` 는 PC 화면에 표시된다.
 - `pong` — `ping` 의 `t` 를 **그대로** 돌려준다. 값을 바꾸면 안 된다.
 - `latency` — 1 초마다. 위에서 측정한 두 값.
+- `trim` — 사용자가 폰에서 립싱크를 직접 조절했을 때. 2 차 기능이므로
+  [PROMPT2.md](PROMPT2.md) 참고. 1 차에서는 보내지 않아도 된다.
 - `bye` — 사용자가 앱을 끌 때.
 
 TCP 연결이 끊기면 PC 는 자동으로 로컬 스피커 출력으로 되돌아간다.

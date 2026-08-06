@@ -464,7 +464,9 @@ class KeystonePlayer(QMainWindow):
         self.control.connected.connect(self._on_phone_connected)
         self.control.disconnected.connect(self._on_phone_disconnected)
         self.control.latencyReported.connect(self._on_phone_latency)
+        self.control.trimRequested.connect(self._on_phone_trim)
         self.control.statusChanged.connect(self._on_phone_status)
+        self.control.set_log_dir(audio_dsp.default_storage_dir())
 
         # mpv (파일 재생용)
         self.mpv_process: QProcess | None = None
@@ -879,6 +881,11 @@ class KeystonePlayer(QMainWindow):
     def _on_phone_latency(self, total_ms: int):
         if self.net_auto_check.isChecked():
             self.delay_slider.setValue(min(video_delay.MAX_DELAY_MS, total_ms))
+
+    def _on_phone_trim(self, value: int):
+        """폰에서 조절한 보정값. 스핀박스에 반영하면 저장·적용까지 이어진다."""
+        low, high = self.net_offset_spin.minimum(), self.net_offset_spin.maximum()
+        self.net_offset_spin.setValue(max(low, min(high, value)))
 
     def _on_phone_status(self, text: str):
         self.net_status.setText(text)
