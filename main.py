@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QGraphicsView, QGraphicsScene, QToolBar,
 )
 from PySide6.QtCore import Qt, QUrl, QPointF, QRectF, QTimer, QSizeF
-from PySide6.QtGui import QFont, QTransform, QPolygonF
+from PySide6.QtGui import QFont, QIcon, QTransform, QPolygonF
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -1068,10 +1068,28 @@ def _setup_widevine():
         ).strip()
 
 
+def _app_icon() -> QIcon:
+    """설치된 테마 아이콘을 먼저 쓰고, 없으면 소스 옆의 파일을 쓴다.
+
+    ~/.local/bin 에 심볼릭 링크로 설치되므로 __file__ 은 링크 경로다. 실제 위치를
+    풀어야 저장소 안의 icon.svg 를 찾는다.
+    """
+    themed = QIcon.fromTheme("keystone-player")
+    if not themed.isNull():
+        return themed
+    local = os.path.join(os.path.dirname(os.path.realpath(__file__)), "icon.svg")
+    return QIcon(local) if os.path.exists(local) else QIcon()
+
+
 def main():
     _setup_widevine()
     app = QApplication(sys.argv)
     app.setApplicationName("Keystone Player")
+    # 창·작업표시줄 아이콘. 이걸 지정하지 않으면 .desktop 의 Icon 과 무관하게
+    # 기본 아이콘이 뜬다. setDesktopFileName 은 Wayland 에서 창을 .desktop 에
+    # 연결해주는 값이라 둘 다 있어야 한다.
+    app.setDesktopFileName("keystone-player")
+    app.setWindowIcon(_app_icon())
     window = KeystonePlayer()
     window.show()
     sys.exit(app.exec())

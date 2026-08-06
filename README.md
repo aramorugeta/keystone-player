@@ -131,6 +131,21 @@ ln -s $(pwd)/main.py ~/.local/bin/keystone-player
 mkdir -p ~/.local/share/icons/hicolor/scalable/apps/
 cp icon.svg ~/.local/share/icons/hicolor/scalable/apps/keystone-player.svg
 
+# 아이콘 테마 인덱스 (없으면 테마 조회가 실패해서 아이콘이 안 뜬다)
+cat > ~/.local/share/icons/hicolor/index.theme << 'EOF'
+[Icon Theme]
+Name=Hicolor
+Comment=Fallback icon theme
+Directories=scalable/apps
+
+[scalable/apps]
+Size=128
+MinSize=8
+MaxSize=512
+Type=Scalable
+Context=Applications
+EOF
+
 # .desktop 파일 생성
 cat > ~/.local/share/applications/keystone-player.desktop << 'EOF'
 [Desktop Entry]
@@ -144,6 +159,15 @@ Terminal=false
 EOF
 
 update-desktop-database ~/.local/share/applications/
+```
+
+아이콘을 바꾼 뒤에도 예전 것이 계속 보이면 셸이 캐시를 들고 있는 것이다.
+KDE 에서는:
+
+```bash
+rm -f ~/.cache/icon-cache.kcache
+kbuildsycoca6 --noincremental
+kquitapp6 plasmashell && kstart plasmashell   # 또는 로그아웃 후 재로그인
 ```
 
 ## 사용법

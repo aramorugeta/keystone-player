@@ -190,6 +190,9 @@ class ReceiverService : Service() {
         latencyJob = scope.launch {
             val samples = ArrayDeque<ReceiverState.Sample>()
             val underrunTimes = ArrayDeque<Long>()
+            // PROMPT2.md: "최근 8 개 샘플의 중앙값" — 원천에서 스무딩
+            val outWindow = ArrayDeque<Int>()
+            val bufWindow = ArrayDeque<Int>()
             var lastUnderrun = 0
             val startNs = System.nanoTime()
 
@@ -198,14 +201,23 @@ class ReceiverService : Service() {
                 val jb = jitter ?: continue
                 val ap = player ?: continue
                 jb.maybeShrinkTarget()
-                val outMs = ap.outputMsMedian()
-                val bufMs = jb.bufferedMs()
+
+                // 순간 표본
+                val outRaw = ap.snapshotOutputMs()
+                val bufRaw = jb.bufferedMs()
+                pushWindow(outWindow, outRaw)
+                pushWindow(bufWindow, bufRaw)
+
+                // 8개 중앙값 (부족하면 있는 만큼)
+                val outMs = median(outWindow)
+                val bufMs = median(bufWindow)
                 val curUnderruns = jb.underruns()
                 val nowMs = (System.nanoTime() - startNs) / 1_000_000L
 
+                // PC 에는 두 값을 분리해서 보낸다. buffer_ms 가 0 이 아니어야 드리프트 진단이 된다.
                 control?.reportLatency(outMs, bufMs)
 
-                // 상단 표시용 값
+                // UI 상단 표시값 (스무딩된 값)
                 ReceiverState.outputMs.value = outMs
                 ReceiverState.bufferMs.value = bufMs
                 ReceiverState.underruns.value = curUnderruns
@@ -230,6 +242,17 @@ class ReceiverService : Service() {
                 ReceiverState.drift.value = computeDrift(samples)
             }
         }
+    }
+
+    private fun pushWindow(window: ArrayDeque<Int>, value: Int) {
+        window.addLast(value)
+        while (window.size > 8) window.removeFirst()
+    }
+
+    private fun median(window: ArrayDeque<Int>): Int {
+        if (window.isEmpty()) return 0
+        val sorted = window.toIntArray().also { it.sort() }
+        return sorted[sorted.size / 2]
     }
 
     /**
