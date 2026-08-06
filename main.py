@@ -2,15 +2,13 @@
 """
 Keystone Player - 프로젝터용 좌우 키스톤 보정 영상 플레이어
 에뮬레이터 창에서 키스톤 보정 미리보기 + 프로젝터 출력
-파일(mpv) 재생 및 브라우저(QWebEngineView) 재생 지원
+파일(QMediaPlayer) 재생 및 브라우저(QWebEngineView) 재생 지원
 """
 
 import sys
 import os
 import json
-import socket
 import statistics
-import tempfile
 from collections import deque
 from pathlib import Path
 
@@ -37,7 +35,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QSizePolicy, QLineEdit, QSpinBox,
     QCheckBox, QGraphicsView, QGraphicsScene, QToolBar,
 )
-from PySide6.QtCore import Qt, QUrl, QPointF, QRectF, QProcess, QTimer, QSizeF
+from PySide6.QtCore import Qt, QUrl, QPointF, QRectF, QTimer, QSizeF
 from PySide6.QtGui import QFont, QTransform, QPolygonF
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -478,16 +476,7 @@ class KeystonePlayer(QMainWindow):
         self.control.set_log_dir(audio_dsp.default_storage_dir())
         self._latency_window: deque = deque(maxlen=LATENCY_WINDOW)
 
-        # mpv (파일 재생용)
-        self.mpv_process: QProcess | None = None
-        self.ipc_path = os.path.join(tempfile.gettempdir(), f"keystone-mpv-{os.getpid()}")
-        self.is_paused = False
-
         self._build_ui()
-
-        self.status_timer = QTimer()
-        self.status_timer.timeout.connect(self._poll_mpv_status)
-        self.status_timer.start(500)
 
     def _build_ui(self):
         central = QWidget()
@@ -501,7 +490,7 @@ class KeystonePlayer(QMainWindow):
 
         mode_row = QHBoxLayout()
         self.mode_combo = QComboBox()
-        self.mode_combo.addItem("파일 (mpv)", "file")
+        self.mode_combo.addItem("파일", "file")
         self.mode_combo.addItem("브라우저 (Web)", "browser")
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         mode_row.addWidget(QLabel("모드:"))
@@ -913,7 +902,6 @@ class KeystonePlayer(QMainWindow):
 
     def _on_mode_changed(self, index: int):
         mode = self.mode_combo.currentData()
-        self._stop_mpv()
         if self.projector_window:
             self.projector_window.hide_content()
         self.playback_mode = mode
@@ -940,7 +928,6 @@ class KeystonePlayer(QMainWindow):
         if checked:
             self._ensure_projector_window()
         else:
-            self._stop_mpv()
             if self.projector_window:
                 self.projector_window.hide_content()
                 self.projector_window._stop_output()
@@ -948,7 +935,6 @@ class KeystonePlayer(QMainWindow):
             self.status_label.setText("준비")
 
     def _on_emulator_window_closed(self):
-        self._stop_mpv()
         self.emulator_check.blockSignals(True)
         self.emulator_check.setChecked(False)
         self.emulator_check.blockSignals(False)
@@ -995,22 +981,6 @@ class KeystonePlayer(QMainWindow):
 
     # ---- 키스톤 ----
 
-    def _calc_perspective_filter(self, k: int, w: int, h: int) -> str:
-        if k == 0:
-            return ""
-        offset = int(abs(k) / 100.0 * h * 0.25)
-        if k > 0:
-            x0, y0 = 0, 0
-            x1, y1 = w, offset
-            x2, y2 = 0, h - offset
-            x3, y3 = w, h
-        else:
-            x0, y0 = 0, offset
-            x1, y1 = w, 0
-            x2, y2 = 0, h
-            x3, y3 = w, h - offset
-        return f"perspective={x0}:{y0}:{x1}:{y1}:{x2}:{y2}:{x3}:{y3}:cubic"
-
     def _on_keystone_changed(self, value: int):
         self.keystone_value = value
         self.ks_value_label.setText(str(value))
@@ -1019,15 +989,7 @@ class KeystonePlayer(QMainWindow):
         self._settings["keystone"] = value
         save_settings(self._settings)
 
-        # mpv 파일 모드: FFmpeg perspective 필터
-        if self.mpv_process and self.mpv_process.state() == QProcess.Running:
-            vf = self._calc_perspective_filter(value, 1920, 1080)
-            if vf:
-                self._send_mpv_command(["set_property", "vf", f"lavfi=[{vf}]"])
-            else:
-                self._send_mpv_command(["set_property", "vf", ""])
-
-        # 브라우저 모드: QTransform
+        # 에뮬레이터/프로젝터 창에 반영
         if self.projector_window:
             self.projector_window.set_keystone(value)
 
@@ -1044,11 +1006,9 @@ class KeystonePlayer(QMainWindow):
             self.status_label.setText("파일을 먼저 선택하세요")
             return
 
-        self._stop_mpv()
         self.emulator_check.setChecked(True)
         pw = self._ensure_projector_window()
         pw.show_video(self.current_file)
-        self.is_paused = False
         self.status_label.setText(f"재생 중: {os.path.basename(self.current_file)}")
 
     def _play_browser(self):
@@ -1059,7 +1019,6 @@ class KeystonePlayer(QMainWindow):
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
 
-        self._stop_mpv()
         self.emulator_check.setChecked(True)
         pw = self._ensure_projector_window()
         pw.show_browser(url)
@@ -1077,49 +1036,11 @@ class KeystonePlayer(QMainWindow):
             self.status_label.setText(f"재생 중: {os.path.basename(self.current_file)}")
 
     def _stop(self):
-        self._stop_mpv()
         if self.projector_window:
             self.projector_window.hide_content()
-        self.is_paused = False
         self.status_label.setText("정지됨")
 
-    # ---- mpv ----
-
-    def _stop_mpv(self):
-        if self.mpv_process and self.mpv_process.state() != QProcess.NotRunning:
-            self._send_mpv_command(["quit"])
-            self.mpv_process.waitForFinished(2000)
-            if self.mpv_process.state() != QProcess.NotRunning:
-                self.mpv_process.kill()
-        self.mpv_process = None
-        self.is_paused = False
-        try:
-            os.unlink(self.ipc_path)
-        except FileNotFoundError:
-            pass
-
-    def _send_mpv_command(self, cmd: list):
-        try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(1.0)
-            sock.connect(self.ipc_path)
-            payload = json.dumps({"command": cmd}) + "\n"
-            sock.sendall(payload.encode())
-            sock.close()
-        except (ConnectionRefusedError, FileNotFoundError, OSError):
-            pass
-
-    def _poll_mpv_status(self):
-        if self.mpv_process and self.mpv_process.state() == QProcess.NotRunning:
-            self.mpv_process = None
-            self.status_label.setText("재생 완료")
-
-    def _on_mpv_finished(self):
-        self.status_label.setText("재생 완료")
-        self.is_paused = False
-
     def closeEvent(self, event):
-        self._stop_mpv()
         if self.projector_window:
             self.projector_window.close()
             self.projector_window = None

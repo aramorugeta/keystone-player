@@ -5,7 +5,7 @@
 
 ## 기능
 
-- **파일 재생** — mpv를 통한 영상 파일 재생 + FFmpeg perspective 필터로 키스톤 보정
+- **파일 재생** — QMediaPlayer로 영상 파일 재생, 에뮬레이터 창에서 키스톤 보정
 - **브라우저 재생** — 내장 브라우저로 웹 콘텐츠 표시 (YouTube, Netflix 등)
 - **Netflix DRM 지원** — Chromium의 Widevine CDM을 활용한 DRM 콘텐츠 재생
 - **에뮬레이터** — 프로젝터 없이도 키스톤 보정 결과를 미리보기
@@ -18,14 +18,13 @@
 
 - Python 3.10+
 - PySide6 (`pip install PySide6`)
-- mpv (파일 재생용)
 - Chromium 설치 (Netflix DRM용, Widevine CDM 필요)
 - PipeWire + `ladspa-swh-plugins` (사운드 보정용, 없으면 해당 기능만 비활성화)
 
 ### Fedora 설치 예시
 
 ```bash
-sudo dnf install mpv chromium ladspa-swh-plugins
+sudo dnf install chromium ladspa-swh-plugins
 pip install PySide6
 ```
 
@@ -150,9 +149,9 @@ update-desktop-database ~/.local/share/applications/
 ## 사용법
 
 ### 파일 모드
-1. 모드를 "파일 (mpv)"로 선택
+1. 모드를 "파일"로 선택
 2. "열기"로 영상 파일 선택
-3. "재생" 클릭 → mpv 창에서 키스톤 보정된 영상 재생
+3. "재생" 클릭 → 에뮬레이터 창에 키스톤 보정된 영상 재생
 
 ### 브라우저 모드
 1. 모드를 "브라우저 (Web)"으로 선택
