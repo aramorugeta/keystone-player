@@ -31,7 +31,7 @@ class ControlClient(
     private val listener: Listener,
 ) {
     interface Listener {
-        fun onHello(audio: AudioParams)
+        fun onHello(audio: AudioParams, trimMs: Int)
         fun onProtocolMismatch(remoteVersion: Int)
         fun onConnected()
         fun onStop()
@@ -72,6 +72,14 @@ class ControlClient(
             put("type", "latency")
             put("output_ms", outputMs)
             put("buffer_ms", bufferMs)
+        })
+    }
+
+    /** 소파에서 폰으로 직접 립싱크를 맞출 때. PC 가 즉시 영상 지연에 반영한다. */
+    fun sendTrim(offsetMs: Int) {
+        sendSync(JSONObject().apply {
+            put("type", "trim")
+            put("offset_ms", offsetMs)
         })
     }
 
@@ -125,6 +133,7 @@ class ControlClient(
                     return
                 }
                 val audio = msg.optJSONObject("audio") ?: return
+                val trim = msg.optInt("trim_ms", 0)
                 listener.onHello(
                     AudioParams(
                         transport = audio.optString("transport", "rtp"),
@@ -133,7 +142,8 @@ class ControlClient(
                         rate = audio.optInt("rate", 48000),
                         channels = audio.optInt("channels", 2),
                         packetMs = audio.optInt("packet_ms", 5),
-                    )
+                    ),
+                    trim,
                 )
             }
             "ping" -> {

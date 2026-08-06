@@ -9,7 +9,9 @@ import sys
 import os
 import json
 import socket
+import statistics
 import tempfile
+from collections import deque
 from pathlib import Path
 
 SETTINGS_DIR = os.path.join(Path.home(), ".local", "share", "keystone-player")
@@ -50,6 +52,13 @@ import video_delay
 
 LOGICAL_W = 1920
 LOGICAL_H = 1080
+
+# 폰이 보고하는 지연은 초 단위로 수십 ms 씩 흔들린다. 그대로 따라가면 영상이
+# 계속 앞뒤로 밀려서 떨린다. 중앙값을 쓰고, 사람이 알아챌 만큼 어긋났을 때만 움직인다.
+# 립싱크는 소리가 +45ms 늦으면 감지되기 시작한다 (ITU-R BT.1359).
+# 그 아래로 따라가봐야 보이지도 않는 흔들림만 만든다.
+LATENCY_WINDOW = 8
+DELAY_HYSTERESIS_MS = 40
 
 # 브라우저 모드에서 바로 고를 수 있는 스트리밍 사이트
 STREAMING_SITES = [
@@ -467,6 +476,7 @@ class KeystonePlayer(QMainWindow):
         self.control.trimRequested.connect(self._on_phone_trim)
         self.control.statusChanged.connect(self._on_phone_status)
         self.control.set_log_dir(audio_dsp.default_storage_dir())
+        self._latency_window: deque = deque(maxlen=LATENCY_WINDOW)
 
         # mpv (파일 재생용)
         self.mpv_process: QProcess | None = None
@@ -873,14 +883,23 @@ class KeystonePlayer(QMainWindow):
         self._sync_dsp()
 
     def _on_phone_disconnected(self):
+        self._latency_window.clear()
         self.dsp.clear_network_target()
         self._sync_dsp()
         if self.net_auto_check.isChecked():
             self.delay_slider.setValue(0)
 
     def _on_phone_latency(self, total_ms: int):
-        if self.net_auto_check.isChecked():
-            self.delay_slider.setValue(min(video_delay.MAX_DELAY_MS, total_ms))
+        if not self.net_auto_check.isChecked():
+            return
+        self._latency_window.append(total_ms)
+        target = min(
+            video_delay.MAX_DELAY_MS,
+            int(statistics.median(self._latency_window)),
+        )
+        # 잔떨림까지 따라가면 영상이 계속 흔들린다
+        if abs(target - self.delay_slider.value()) >= DELAY_HYSTERESIS_MS:
+            self.delay_slider.setValue(target)
 
     def _on_phone_trim(self, value: int):
         """폰에서 조절한 보정값. 스핀박스에 반영하면 저장·적용까지 이어진다."""

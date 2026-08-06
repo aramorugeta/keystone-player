@@ -13,6 +13,7 @@ PC 와 폰의 48000 Hz 는 정확히 같지 않다. 어긋난 만큼 폰의 지�
 """
 
 import csv
+import statistics
 import os
 import sys
 from pathlib import Path
@@ -20,22 +21,57 @@ from pathlib import Path
 DEFAULT_LOG = os.path.join(
     Path.home(), ".local", "share", "keystone-player", "latency-log.csv"
 )
-# 이 이상 기울면 긴 영화에서 눈에 띄게 밀린다고 본다
-DRIFT_PPM_THRESHOLD = 5.0
+# 소리가 이만큼 늦으면 사람이 알아채기 시작한다 (ITU-R BT.1359).
+# 이 아래로 밀리는 드리프트는 있어도 없는 것과 같으므로 무시한다.
+PERCEPTIBLE_MS = 45
+FILM_HOURS = 2
 DELAY_CAP_MS = 500
 
 
-def slope(xs, ys) -> float:
-    """최소제곱 기울기 (y 단위 / x 단위)."""
-    n = len(xs)
-    if n < 2:
+def robust_trend(rows: list, key: str) -> float:
+    """시간당 변화량 (ms/시간).
+
+    최소제곱은 쓰지 않는다. 실측해보니 폰 지연은 몇 분 주기로 오르내리는데,
+    직선을 맞추면 그 배회를 드리프트로 오판한다. 앞 1/3 과 뒤 1/3 의 중앙값을
+    비교하면 중간의 출렁임에 휘둘리지 않고 순 변화만 남는다.
+    """
+    n = len(rows)
+    if n < 6:
         return 0.0
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    denom = sum((x - mx) ** 2 for x in xs)
-    if denom == 0:
+    third = n // 3
+    head, tail = rows[:third], rows[-third:]
+    dt = (
+        statistics.median([r["t"] for r in tail])
+        - statistics.median([r["t"] for r in head])
+    )
+    if dt <= 0:
         return 0.0
-    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
+    delta = (
+        statistics.median([r[key] for r in tail])
+        - statistics.median([r[key] for r in head])
+    )
+    return delta / dt * 3600
+
+
+def direction_changes(rows: list, key: str, buckets: int = 6) -> int:
+    """구간 중앙값이 오르내린 횟수.
+
+    클럭 드리프트는 한 방향으로만 쌓인다. 방향이 여러 번 바뀌면 그건 드리프트가
+    아니라 배회이고, 앞뒤만 비교하면 배회의 반 주기를 드리프트로 오해하게 된다.
+    """
+    if len(rows) < buckets * 3:
+        return 0
+    span = rows[-1]["t"] - rows[0]["t"]
+    if span <= 0:
+        return 0
+    groups: dict = {}
+    for r in rows:
+        idx = min(buckets - 1, int((r["t"] - rows[0]["t"]) / span * buckets))
+        groups.setdefault(idx, []).append(r[key])
+    mids = [statistics.median(groups[i]) for i in sorted(groups)]
+    diffs = [b - a for a, b in zip(mids, mids[1:])
+             if abs(b - a) >= PERCEPTIBLE_MS / 4]  # 미세한 흔들림은 방향으로 안 침
+    return sum(1 for a, b in zip(diffs, diffs[1:]) if (a > 0) != (b > 0))
 
 
 def load(path: str) -> dict:
@@ -79,17 +115,33 @@ def report(name: str, rows: list):
         return
 
     # 버퍼 기울기 → ppm. 1시간에 3.6ms 밀리면 1ppm.
-    per_hour = slope([r["t"] for r in rows], buffers) * 3600
-    ppm = per_hour / 3.6
-    direction = "차오름" if per_hour > 0 else "마름"
-    print(f"   버퍼 추세 {per_hour:+.0f} ms/시간 → 클럭 차이 약 {ppm:+.1f} ppm ({direction})")
+    # 폰이 버퍼를 항상 0 으로 보고하는 구현도 있어서, 실제로 영상 지연을 움직이는
+    # 총지연으로 판정한다.
+    per_hour = robust_trend(rows, "total")
+    film = abs(per_hour) * FILM_HOURS
+    print(f"   총지연 추세 {per_hour:+.0f} ms/시간 → 클럭 차이 약 {per_hour / 3.6:+.1f} ppm")
+    print(f"   {FILM_HOURS}시간 누적 {film:.0f}ms (지각 한계 {PERCEPTIBLE_MS}ms)")
 
-    if abs(ppm) < DRIFT_PPM_THRESHOLD:
-        print("   → 드리프트 없음. 지금 구조로 충분하다.")
+    # 한쪽으로 미는 것과 제자리에서 출렁이는 것은 대처가 다르다
+    mids = [r["total"] for r in rows]
+    wander = statistics.median(
+        [abs(b - a) for a, b in zip(mids, mids[1:])]
+    ) if len(mids) > 1 else 0
+    spread = max(mids) - min(mids)
+    print(f"   배회 폭 {spread:.0f}ms (보고 간 중앙 변화 {wander:.0f}ms)")
+
+    # 드리프트는 한쪽으로만 민다. 오르내리면 배회지 드리프트가 아니다.
+    turns = direction_changes(rows, "total")
+    if turns >= 2:
+        print(f"   구간별로 방향이 {turns}번 바뀜 → 한쪽으로 미는 것이 아니라 배회")
+        print("   → 드리프트라 볼 수 없다. 판정하려면 더 긴 세션(영화 한 편)이 필요하다.")
+    elif film < PERCEPTIBLE_MS:
+        print("   → 드리프트 없음. 적응형 리샘플링 불필요.")
     else:
-        two_hours = abs(per_hour) * 2
-        print(f"   → 드리프트 있음. 2시간 영화면 약 {two_hours:.0f}ms 밀린다.")
-        print("      폰에서 버퍼 수위에 맞춘 적응형 리샘플링이 필요하다.")
+        print("   → 드리프트 있음. 폰에서 버퍼 수위에 맞춘 적응형 리샘플링이 필요하다.")
+
+    if spread >= PERCEPTIBLE_MS:
+        print("      배회 폭이 지각 한계를 넘으므로 영상 지연이 가끔 재조정된다.")
 
 
 def main():

@@ -110,7 +110,7 @@ class ReceiverService : Service() {
                 updateNotification("연결됨 — hello 대기 중")
             }
 
-            override fun onHello(audio: ControlClient.AudioParams) {
+            override fun onHello(audio: ControlClient.AudioParams, trimMs: Int) {
                 if (audio.format != "s16be" || audio.rate != 48000 || audio.channels != 2) {
                     ReceiverState.status.value =
                         "지원되지 않는 포맷: ${audio.format} ${audio.rate}Hz ${audio.channels}ch"
@@ -118,6 +118,7 @@ class ReceiverService : Service() {
                     return
                 }
                 startAudioPath(audio.port)
+                ReceiverState.trimMs.value = trimMs
                 ReceiverState.connecting.value = false
                 ReceiverState.connected.value = true
                 ReceiverState.status.value = "연결됨 — $host"
@@ -150,6 +151,8 @@ class ReceiverService : Service() {
         val jb = jitter ?: return
         player = AudioPlayer(jb).also { it.start() }
         receiver = RtpReceiver(rtpPort, jb).also { it.start() }
+        // UI 슬라이더가 이 콜백으로 트림 값을 넣는다.
+        control?.let { c -> ReceiverBridge.bind { offset -> c.sendTrim(offset) } }
         Log.i(TAG, "오디오 시작 (rtp $rtpPort)")
     }
 
@@ -158,6 +161,7 @@ class ReceiverService : Service() {
     }
 
     private fun disconnect() {
+        ReceiverBridge.unbind()
         latencyJob?.cancel()
         latencyJob = null
         control?.stop(); control = null
@@ -178,9 +182,17 @@ class ReceiverService : Service() {
         stopSelf()
     }
 
+    /** 그래프 창 길이. 5분치를 초 단위로 유지한다. */
+    private val historyWindowMs = 5L * 60 * 1000
+
     private fun startLatencyReports() {
         latencyJob?.cancel()
         latencyJob = scope.launch {
+            val samples = ArrayDeque<ReceiverState.Sample>()
+            val underrunTimes = ArrayDeque<Long>()
+            var lastUnderrun = 0
+            val startNs = System.nanoTime()
+
             while (isActive) {
                 delay(1000)
                 val jb = jitter ?: continue
@@ -188,12 +200,62 @@ class ReceiverService : Service() {
                 jb.maybeShrinkTarget()
                 val outMs = ap.outputMsMedian()
                 val bufMs = jb.bufferedMs()
+                val curUnderruns = jb.underruns()
+                val nowMs = (System.nanoTime() - startNs) / 1_000_000L
+
                 control?.reportLatency(outMs, bufMs)
+
+                // 상단 표시용 값
                 ReceiverState.outputMs.value = outMs
                 ReceiverState.bufferMs.value = bufMs
-                ReceiverState.underruns.value = jb.underruns()
+                ReceiverState.underruns.value = curUnderruns
+
+                // 그래프 이력
+                samples.addLast(ReceiverState.Sample(nowMs, bufMs, outMs))
+                while (samples.isNotEmpty() && nowMs - samples.first().tMs > historyWindowMs) {
+                    samples.removeFirst()
+                }
+                if (curUnderruns > lastUnderrun) {
+                    underrunTimes.addLast(nowMs)
+                    lastUnderrun = curUnderruns
+                }
+                while (underrunTimes.isNotEmpty() && nowMs - underrunTimes.first() > historyWindowMs) {
+                    underrunTimes.removeFirst()
+                }
+
+                ReceiverState.history.value = samples.toList()
+                ReceiverState.underrunEvents.value = underrunTimes.toList()
+
+                // 드리프트: 5분 이상 데이터가 쌓였을 때만
+                ReceiverState.drift.value = computeDrift(samples)
             }
         }
+    }
+
+    /**
+     * 버퍼 깊이의 최소제곱 기울기 → ppm.
+     * ppm = (ms/hour) / 3.6  (PROMPT2.md 공식)
+     */
+    private fun computeDrift(samples: Collection<ReceiverState.Sample>): ReceiverState.Drift? {
+        if (samples.size < 60) return null   // 최소 1분치 있어야 회귀가 의미 있다
+        val first = samples.first().tMs
+        val last = samples.last().tMs
+        if (last - first < 5L * 60 * 1000) return null  // 5분 미만이면 표시 안함
+
+        var n = 0.0
+        var sx = 0.0; var sy = 0.0; var sxx = 0.0; var sxy = 0.0
+        for (s in samples) {
+            val x = (s.tMs - first) / 1000.0   // 초 단위
+            val y = s.bufferMs.toDouble()
+            n += 1.0; sx += x; sy += y; sxx += x * x; sxy += x * y
+        }
+        val denom = n * sxx - sx * sx
+        if (denom <= 0) return null
+        val slopeMsPerSec = (n * sxy - sx * sy) / denom
+        val msPerHour = slopeMsPerSec * 3600.0
+        val ppm = msPerHour / 3.6
+        val projected2h = (msPerHour * 2).toInt()
+        return ReceiverState.Drift(ppm = ppm, projected2hMs = projected2h)
     }
 
     // ---- Wake / WiFi locks ----
