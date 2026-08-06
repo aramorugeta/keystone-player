@@ -1,25 +1,25 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
   <!--
-    프로젝터 렌즈에서 나온 빛이 사다리꼴 화면을 만든다.
-    사다리꼴 자체가 이 앱의 정체(키스톤 보정)이고, 재생 삼각형으로 플레이어임을 나타낸다.
-    24px 까지 줄여도 형태가 유지되도록 요소를 셋으로 제한했다.
+    천장에 매단 프로젝터. 배경은 투명이라 밝은 테마와 어두운 테마 양쪽에서 쓴다.
+    선 굵기 7 은 24px 로 줄였을 때 형태가 남는 최소치다. 조작부를 두 줄로 줄이고
+    본체를 캔버스 끝까지 키운 것도 같은 이유 — 런처가 실제로 쓰는 크기는 32~48px 다.
   -->
-  <defs>
-    <linearGradient id="beam" x1="0" y1="1" x2="0.6" y2="0">
-      <stop offset="0" stop-color="#E8471C"/>
-      <stop offset="0.55" stop-color="#F5941F"/>
-      <stop offset="1" stop-color="#FFC94A"/>
-    </linearGradient>
-  </defs>
+  <g fill="none" stroke="#0050B5" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <!-- 천장 레일과 마운트 -->
+    <path d="M30 12 H98"/>
+    <rect x="56" y="16" width="16" height="14" fill="#52A0FF"/>
 
-  <rect width="128" height="128" rx="28" fill="#171C2B"/>
+    <!-- 받침 -->
+    <rect x="19" y="88" width="90" height="18" rx="6" fill="#52A0FF"/>
 
-  <!-- 렌즈 -->
-  <circle cx="20" cy="64" r="7" fill="#F5941F"/>
+    <!-- 본체 -->
+    <rect x="9" y="34" width="110" height="60" rx="10" fill="#fff"/>
 
-  <!-- 키스톤 보정된 투사면 -->
-  <polygon points="34,47 104,21 104,107 34,81" fill="url(#beam)"/>
+    <!-- 렌즈 -->
+    <circle cx="45" cy="64" r="25" fill="#fff"/>
+    <circle cx="45" cy="64" r="15" fill="#52A0FF"/>
 
-  <!-- 재생 -->
-  <polygon points="60,52 88,64 60,76" fill="#171C2B"/>
+    <!-- 조작부 -->
+    <path d="M84 54 H106 M84 74 H106"/>
+  </g>
 </svg>
