@@ -45,6 +45,7 @@ from PySide6.QtWebEngineCore import (
 )
 
 import audio_dsp
+import net_audio
 import video_delay
 
 LOGICAL_W = 1920
@@ -450,6 +451,13 @@ class KeystonePlayer(QMainWindow):
         )
         self.dsp.set_volume(self.volume_value)
 
+        # 폰으로 소리 보내기 (컨트롤 채널)
+        self.control = net_audio.ControlServer(self)
+        self.control.connected.connect(self._on_phone_connected)
+        self.control.disconnected.connect(self._on_phone_disconnected)
+        self.control.latencyReported.connect(self._on_phone_latency)
+        self.control.statusChanged.connect(self._on_phone_status)
+
         # mpv (파일 재생용)
         self.mpv_process: QProcess | None = None
         self.ipc_path = os.path.join(tempfile.gettempdir(), f"keystone-mpv-{os.getpid()}")
@@ -632,6 +640,28 @@ class KeystonePlayer(QMainWindow):
         sound_layout.addWidget(self.dsp_status)
         layout.addWidget(sound_group)
 
+        # --- 폰으로 소리 보내기 ---
+        net_group = QGroupBox("폰으로 소리 보내기")
+        net_layout = QVBoxLayout(net_group)
+
+        net_row = QHBoxLayout()
+        self.net_check = QCheckBox("네트워크 출력 (무압축 RTP)")
+        self.net_check.toggled.connect(self._on_net_toggled)
+        net_row.addWidget(self.net_check)
+        net_row.addStretch()
+        self.net_auto_check = QCheckBox("지연 자동 보정")
+        self.net_auto_check.setChecked(True)
+        self.net_auto_check.toggled.connect(self._on_net_auto_toggled)
+        net_row.addWidget(self.net_auto_check)
+        net_layout.addLayout(net_row)
+
+        self.net_addr_label = QLabel()
+        net_layout.addWidget(self.net_addr_label)
+        self.net_status = QLabel("꺼짐")
+        self.net_status.setWordWrap(True)
+        net_layout.addWidget(self.net_status)
+        layout.addWidget(net_group)
+
         self._init_sound_controls()
 
         # --- 재생 컨트롤 ---
@@ -687,6 +717,12 @@ class KeystonePlayer(QMainWindow):
         if self._settings.get("audio_dsp", False):
             self.dsp_check.setChecked(True)  # _on_dsp_toggled 가 시작시킨다
 
+        self.net_auto_check.blockSignals(True)
+        self.net_auto_check.setChecked(self._settings.get("net_auto_delay", True))
+        self.net_auto_check.blockSignals(False)
+        if self._settings.get("net_audio", False):
+            self.net_check.setChecked(True)
+
     def _on_dsp_toggled(self, checked: bool):
         if checked:
             error = self.dsp.start()
@@ -727,6 +763,71 @@ class KeystonePlayer(QMainWindow):
         self.dsp.set_ceiling_db(float(value))
         self._settings["audio_ceiling"] = value
         save_settings(self._settings)
+
+    # ---- 폰으로 소리 보내기 ----
+
+    @staticmethod
+    def _lan_address() -> str:
+        """폰에서 입력할 이 PC 의 주소."""
+        from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
+        for iface in QNetworkInterface.allInterfaces():
+            flags = iface.flags()
+            if not (flags & QNetworkInterface.IsUp) or (flags & QNetworkInterface.IsLoopBack):
+                continue
+            for entry in iface.addressEntries():
+                addr = entry.ip()
+                if addr.protocol() == QAbstractSocket.IPv4Protocol:
+                    return addr.toString()
+        return "주소를 찾을 수 없음"
+
+    def _on_net_toggled(self, checked: bool):
+        if checked:
+            # RTP 송출은 DSP 체인 안에서 만들어지므로 사운드 보정이 켜져 있어야 한다
+            if not self.dsp_check.isChecked():
+                if not self.dsp_check.isEnabled():
+                    self.net_status.setText("사용 불가 — 사운드 보정을 먼저 쓸 수 있어야 합니다")
+                    self.net_check.blockSignals(True)
+                    self.net_check.setChecked(False)
+                    self.net_check.blockSignals(False)
+                    return
+                self.dsp_check.setChecked(True)
+
+            error = self.control.start()
+            if error:
+                self.net_status.setText(f"시작 실패 — {error}")
+                self.net_check.blockSignals(True)
+                self.net_check.setChecked(False)
+                self.net_check.blockSignals(False)
+                return
+            self.net_addr_label.setText(
+                f"폰에 입력할 주소: {self._lan_address()} : {net_audio.CONTROL_PORT}"
+            )
+        else:
+            self.control.stop()
+            self.dsp.clear_network_target()
+            self.net_addr_label.clear()
+
+        self._settings["net_audio"] = checked
+        save_settings(self._settings)
+
+    def _on_net_auto_toggled(self, checked: bool):
+        self._settings["net_auto_delay"] = checked
+        save_settings(self._settings)
+
+    def _on_phone_connected(self, ip: str):
+        self.dsp.set_network_target(ip, net_audio.AUDIO_PORT)
+
+    def _on_phone_disconnected(self):
+        self.dsp.clear_network_target()
+        if self.net_auto_check.isChecked():
+            self.delay_slider.setValue(0)
+
+    def _on_phone_latency(self, total_ms: int):
+        if self.net_auto_check.isChecked():
+            self.delay_slider.setValue(min(video_delay.MAX_DELAY_MS, total_ms))
+
+    def _on_phone_status(self, text: str):
+        self.net_status.setText(text)
 
     # ---- UI 이벤트 ----
 
@@ -934,6 +1035,7 @@ class KeystonePlayer(QMainWindow):
         if self.projector_window:
             self.projector_window.close()
             self.projector_window = None
+        self.control.stop()
         self.dsp.stop()
         super().closeEvent(event)
 

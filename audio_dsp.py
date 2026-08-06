@@ -31,6 +31,14 @@ LIMIT_LABEL = "fastLookaheadLimiter"
 
 SINK_NAME = "keystone_dsp"
 SINK_DESC = "Keystone Player DSP"
+RTP_SINK_NAME = "keystone_rtp"
+
+# RTP 송출 설정 — 안드로이드 수신 앱과 반드시 일치해야 한다 (net_audio.py 와 동일)
+RTP_FORMAT = "S16BE"
+RTP_RATE = 48000
+RTP_CHANNELS = 2
+RTP_PACKET_MS = 5
+RTP_LATENCY_MS = 20  # PC 쪽 송출 버퍼. 지터 흡수는 폰이 담당한다
 
 # 강도 프리셋: (threshold dB, ratio, attack ms, release ms, makeup gain dB)
 PRESETS = {
@@ -98,6 +106,7 @@ class AudioDSP(QObject):
         self._ceiling_db = DEFAULT_CEILING
         self._volume = 100
         self._moved: set[int] = set()
+        self._net_target: tuple[str, int] | None = None
 
         # 새로 생긴 스트림을 주기적으로 DSP 싱크로 옮긴다
         self._move_timer = QTimer(self)
@@ -173,6 +182,30 @@ class AudioDSP(QObject):
             pass
 
     # ---- 파라미터 ----
+
+    def set_network_target(self, ip: str, port: int):
+        """DSP 출력을 이 주소로 RTP 송출한다 (로컬 스피커 대신)."""
+        target = (ip, int(port))
+        if target == self._net_target:
+            return
+        self._net_target = target
+        self._restart_if_running()
+
+    def clear_network_target(self):
+        """로컬 출력으로 되돌린다."""
+        if self._net_target is None:
+            return
+        self._net_target = None
+        self._restart_if_running()
+
+    def network_target(self) -> tuple[str, int] | None:
+        return self._net_target
+
+    def _restart_if_running(self):
+        """출력 경로가 바뀌면 체인을 다시 띄운다 (짧은 끊김 발생)."""
+        if self.is_running():
+            self.stop()
+            self.start()
 
     def set_preset(self, name: str):
         if name in PRESETS:
@@ -299,6 +332,43 @@ class AudioDSP(QObject):
 
     # ---- 설정 파일 ----
 
+    def _rtp_module(self) -> str:
+        """네트워크 출력이 켜져 있으면 RTP 송출 싱크를 만드는 모듈 블록."""
+        if self._net_target is None:
+            return ""
+        ip, port = self._net_target
+        return f"""    {{ name = libpipewire-module-rtp-sink
+        args = {{
+            destination.ip   = "{ip}"
+            destination.port = {port}
+            net.mtu          = 1280
+            sess.min-ptime   = {RTP_PACKET_MS}
+            sess.max-ptime   = {RTP_PACKET_MS}
+            sess.latency.msec = {RTP_LATENCY_MS}
+            audio.format     = "{RTP_FORMAT}"
+            audio.rate       = {RTP_RATE}
+            audio.channels   = {RTP_CHANNELS}
+            audio.position   = [ FL FR ]
+            stream.props = {{
+                node.name        = "{RTP_SINK_NAME}"
+                node.description = "Keystone RTP ({ip})"
+                media.class      = Audio/Sink
+            }}
+        }}
+    }}
+"""
+
+    def _playback_props(self) -> str:
+        """네트워크 출력이면 RTP 싱크로, 아니면 시스템 기본 출력으로 보낸다."""
+        if self._net_target is not None:
+            return f"""node.name     = "{SINK_NAME}_out"
+                node.passive  = false
+                target.object = "{RTP_SINK_NAME}"
+                audio.position = [ FL FR ]"""
+        return f"""node.name    = "{SINK_NAME}_out"
+                node.passive = true
+                audio.position = [ FL FR ]"""
+
     def _write_conf(self):
         os.makedirs(self.storage_dir, exist_ok=True)
         _, thr, ratio, attack, release, makeup = PRESETS[self._preset]
@@ -311,7 +381,7 @@ context.modules = [
     {{ name = libpipewire-module-protocol-native }}
     {{ name = libpipewire-module-client-node }}
     {{ name = libpipewire-module-adapter }}
-    {{ name = libpipewire-module-filter-chain
+{self._rtp_module()}    {{ name = libpipewire-module-filter-chain
         args = {{
             node.description = "{SINK_DESC}"
             media.name       = "{SINK_DESC}"
@@ -365,9 +435,7 @@ context.modules = [
                 audio.position = [ FL FR ]
             }}
             playback.props = {{
-                node.name    = "{SINK_NAME}_out"
-                node.passive = true
-                audio.position = [ FL FR ]
+                {self._playback_props()}
             }}
         }}
     }}
