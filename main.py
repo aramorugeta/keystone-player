@@ -32,7 +32,7 @@ def save_settings(data: dict):
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QFileDialog, QComboBox,
-    QGroupBox, QSizePolicy, QLineEdit,
+    QGroupBox, QSizePolicy, QLineEdit, QSpinBox,
     QCheckBox, QGraphicsView, QGraphicsScene, QToolBar,
 )
 from PySide6.QtCore import Qt, QUrl, QPointF, QRectF, QProcess, QTimer, QSizeF
@@ -50,6 +50,14 @@ import video_delay
 
 LOGICAL_W = 1920
 LOGICAL_H = 1080
+
+# 브라우저 모드에서 바로 고를 수 있는 스트리밍 사이트
+STREAMING_SITES = [
+    ("넷플릭스", "https://www.netflix.com"),
+    ("디즈니+", "https://www.disneyplus.com"),
+    ("티빙", "https://www.tving.com"),
+    ("직접 입력", ""),
+]
 
 
 def make_graphics_view(scene: QGraphicsScene) -> QGraphicsView:
@@ -506,6 +514,11 @@ class KeystonePlayer(QMainWindow):
         self.browser_widget = QWidget()
         browser_layout = QHBoxLayout(self.browser_widget)
         browser_layout.setContentsMargins(0, 0, 0, 0)
+        self.site_combo = QComboBox()
+        for label, url in STREAMING_SITES:
+            self.site_combo.addItem(label, url)
+        self.site_combo.currentIndexChanged.connect(self._on_site_changed)
+        browser_layout.addWidget(self.site_combo)
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("https://www.youtube.com/watch?v=...")
         self.url_input.returnPressed.connect(self._play_browser)
@@ -515,6 +528,7 @@ class KeystonePlayer(QMainWindow):
         browser_layout.addWidget(self.url_input)
         browser_layout.addWidget(btn_go)
         mode_layout.addWidget(self.browser_widget)
+        self.url_input.setText(self.site_combo.currentData())
         self.browser_widget.hide()
 
         layout.addWidget(mode_group)
@@ -655,6 +669,21 @@ class KeystonePlayer(QMainWindow):
         net_row.addWidget(self.net_auto_check)
         net_layout.addLayout(net_row)
 
+        trim_row = QHBoxLayout()
+        trim_row.addWidget(QLabel("수동 보정:"))
+        self.net_offset_spin = QSpinBox()
+        self.net_offset_spin.setRange(-200, 300)
+        self.net_offset_spin.setSingleStep(10)
+        self.net_offset_spin.setSuffix(" ms")
+        self.net_offset_spin.setToolTip(
+            "소리가 늦게 들리면 값을 올리고, 너무 앞서면 내린다"
+        )
+        self.net_offset_spin.valueChanged.connect(self._on_net_offset_changed)
+        trim_row.addWidget(self.net_offset_spin)
+        trim_row.addWidget(QLabel("(소리가 늦으면 ＋)"))
+        trim_row.addStretch()
+        net_layout.addLayout(trim_row)
+
         self.net_addr_label = QLabel()
         net_layout.addWidget(self.net_addr_label)
         self.net_status = QLabel("꺼짐")
@@ -720,6 +749,13 @@ class KeystonePlayer(QMainWindow):
         self.net_auto_check.blockSignals(True)
         self.net_auto_check.setChecked(self._settings.get("net_auto_delay", True))
         self.net_auto_check.blockSignals(False)
+
+        # 폰이 알 수 없는 PC 쪽 송출 버퍼를 총합에 넣어준다
+        self.control.set_pc_latency(audio_dsp.RTP_LATENCY_MS)
+        self.net_offset_spin.blockSignals(True)
+        self.net_offset_spin.setValue(self._settings.get("net_delay_offset", 0))
+        self.net_offset_spin.blockSignals(False)
+        self.control.set_offset(self.net_offset_spin.value())
         if self._settings.get("net_audio", False):
             self.net_check.setChecked(True)
 
@@ -814,6 +850,11 @@ class KeystonePlayer(QMainWindow):
         self._settings["net_auto_delay"] = checked
         save_settings(self._settings)
 
+    def _on_net_offset_changed(self, value: int):
+        self.control.set_offset(value)
+        self._settings["net_delay_offset"] = value
+        save_settings(self._settings)
+
     def _on_phone_connected(self, ip: str):
         self.dsp.set_network_target(ip, net_audio.AUDIO_PORT)
 
@@ -841,6 +882,14 @@ class KeystonePlayer(QMainWindow):
         self.browser_widget.setVisible(mode == "browser")
         self._update_playback_buttons()
         self.status_label.setText("준비")
+
+    def _on_site_changed(self, index: int):
+        url = self.site_combo.currentData()
+        if url:
+            self.url_input.setText(url)
+        else:
+            self.url_input.clear()
+            self.url_input.setFocus()
 
     def _update_playback_buttons(self):
         is_file = self.playback_mode == "file"

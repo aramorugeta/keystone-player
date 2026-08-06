@@ -54,6 +54,11 @@ class ControlServer(QObject):
         self._buffer = b""
         self._rtts: deque = deque(maxlen=RTT_WINDOW)
         self._device = ""
+        # PC 쪽에서 이미 알고 있는 지연 (RTP 송출 버퍼 등). 폰은 이걸 모른다.
+        self._pc_latency_ms = 0
+        # 남는 오차를 사용자가 직접 맞추는 값
+        self._offset_ms = 0
+        self._last_report: tuple[int, int] | None = None
 
         self._ping_timer = QTimer(self)
         self._ping_timer.timeout.connect(self._send_ping)
@@ -159,18 +164,37 @@ class ControlServer(QObject):
             buffer_ms = self._as_int(msg.get("buffer_ms"))
             if output is None or buffer_ms is None:
                 return
-            one_way = (min(self._rtts) // 2) if self._rtts else 0
-            total = output + buffer_ms + one_way
-            self.latencyReported.emit(total)
-            name = self._device or self.peer_ip()
-            self.statusChanged.emit(
-                f"연결됨 — {name} | 출력 {output}ms + 버퍼 {buffer_ms}ms "
-                f"+ 편도 {one_way}ms = 총 {total}ms"
-            )
+            self._last_report = (output, buffer_ms)
+            self._publish()
 
         elif kind == "bye":
             if self._socket is not None:
                 self._socket.disconnectFromHost()
+
+    def set_pc_latency(self, ms: int):
+        """PC 쪽 송출 버퍼 등 폰이 알 수 없는 지연."""
+        self._pc_latency_ms = max(0, int(ms))
+        self._publish()
+
+    def set_offset(self, ms: int):
+        """자동 계산으로 안 맞는 나머지를 사용자가 직접 더하는 값."""
+        self._offset_ms = int(ms)
+        self._publish()
+
+    def _publish(self):
+        """지금까지 아는 값으로 총 지연을 다시 계산해서 알린다."""
+        if self._last_report is None:
+            return
+        output, buffer_ms = self._last_report
+        one_way = (min(self._rtts) // 2) if self._rtts else 0
+        total = max(0, output + buffer_ms + one_way + self._pc_latency_ms + self._offset_ms)
+        self.latencyReported.emit(total)
+        name = self._device or self.peer_ip()
+        offset_text = f" {self._offset_ms:+d}ms 보정" if self._offset_ms else ""
+        self.statusChanged.emit(
+            f"연결됨 — {name} | 폰 출력 {output} + 버퍼 {buffer_ms} + 편도 {one_way} "
+            f"+ PC {self._pc_latency_ms}{offset_text} = 총 {total}ms"
+        )
 
     @staticmethod
     def _as_int(value):

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Keystone Receiver</string>
+    <string name="notif_channel_name">재생 상태</string>
+    <string name="notif_channel_desc">폰이 PC 오디오를 재생 중일 때 알림</string>
+</resources>
