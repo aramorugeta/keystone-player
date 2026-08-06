@@ -45,6 +45,7 @@ from PySide6.QtWebEngineCore import (
 )
 
 import audio_dsp
+import video_delay
 
 LOGICAL_W = 1920
 LOGICAL_H = 1080
@@ -171,7 +172,9 @@ class ProjectorWindow(QMainWindow):
         self.audio = QAudioOutput()
         self.player = QMediaPlayer()
         self.player.setAudioOutput(self.audio)
-        self.player.setVideoOutput(self.video_item)
+        # 립싱크 보정용 지연 큐를 거쳐 화면으로 나간다 (지연 0 이면 그대로 통과)
+        self.frame_delay = video_delay.FrameDelay(self.video_item.videoSink(), self)
+        self.player.setVideoOutput(self.frame_delay.sink)
 
         self._keystone_value = 0
         self._aspect_value = 0
@@ -361,6 +364,11 @@ class ProjectorWindow(QMainWindow):
     def pause_video(self):
         if self._content_mode == "video":
             self.player.pause()
+            self.frame_delay.clear()
+
+    def set_video_delay(self, ms: int):
+        """립싱크 보정: 영상을 ms 만큼 늦춰서 표시 (파일 재생에만 적용)."""
+        self.frame_delay.set_delay_ms(ms)
 
     def is_video_playing(self) -> bool:
         return (
@@ -377,6 +385,7 @@ class ProjectorWindow(QMainWindow):
     def _stop_video(self):
         if self.player.playbackState() != QMediaPlayer.StoppedState:
             self.player.stop()
+        self.frame_delay.clear()
 
     def hide_content(self):
         """콘텐츠 숨기기 (재생성 없이 숨김만)"""
@@ -604,6 +613,20 @@ class KeystonePlayer(QMainWindow):
         ceiling_row.addWidget(self.ceiling_label)
         sound_layout.addLayout(ceiling_row)
 
+        delay_row = QHBoxLayout()
+        delay_row.addWidget(QLabel("영상 지연 보정:"))
+        self.delay_slider = QSlider(Qt.Horizontal)
+        self.delay_slider.setRange(0, video_delay.MAX_DELAY_MS)
+        self.delay_slider.setTickPosition(QSlider.TicksBelow)
+        self.delay_slider.setTickInterval(50)
+        self.delay_slider.valueChanged.connect(self._on_video_delay_changed)
+        delay_row.addWidget(self.delay_slider)
+        self.delay_label = QLabel()
+        self.delay_label.setFixedWidth(55)
+        self.delay_label.setAlignment(Qt.AlignCenter)
+        delay_row.addWidget(self.delay_label)
+        sound_layout.addLayout(delay_row)
+
         self.dsp_status = QLabel()
         self.dsp_status.setWordWrap(True)
         sound_layout.addWidget(self.dsp_status)
@@ -646,6 +669,12 @@ class KeystonePlayer(QMainWindow):
         self.ceiling_slider.blockSignals(False)
         self.ceiling_label.setText(f"{ceiling} dB")
 
+        delay = int(self._settings.get("video_delay", 0))
+        self.delay_slider.blockSignals(True)
+        self.delay_slider.setValue(delay)
+        self.delay_slider.blockSignals(False)
+        self.delay_label.setText(f"{delay} ms")
+
         problem = audio_dsp.check_requirements()
         if problem:
             self.dsp_check.setEnabled(False)
@@ -685,6 +714,13 @@ class KeystonePlayer(QMainWindow):
         self.dsp.set_preset(preset)
         self._settings["audio_preset"] = preset
         save_settings(self._settings)
+
+    def _on_video_delay_changed(self, value: int):
+        self.delay_label.setText(f"{value} ms")
+        self._settings["video_delay"] = value
+        save_settings(self._settings)
+        if self.projector_window:
+            self.projector_window.set_video_delay(value)
 
     def _on_ceiling_changed(self, value: int):
         self.ceiling_label.setText(f"{value} dB")
@@ -749,6 +785,7 @@ class KeystonePlayer(QMainWindow):
         pw = self.projector_window
         pw.set_keystone(self.keystone_value)
         pw.set_aspect(self.aspect_value)
+        pw.set_video_delay(self.delay_slider.value())
         if not pw.isVisible():
             pw.resize(960, 540)
             pw.show()
