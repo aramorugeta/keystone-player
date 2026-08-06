@@ -44,6 +44,8 @@ from PySide6.QtWebEngineCore import (
     QWebEngineSettings, QWebEngineProfile, QWebEnginePage,
 )
 
+import audio_dsp
+
 LOGICAL_W = 1920
 LOGICAL_H = 1080
 
@@ -174,6 +176,7 @@ class ProjectorWindow(QMainWindow):
         self._keystone_value = 0
         self._aspect_value = 0
         self._content_mode = None  # "browser" / "video" / None
+        self.dsp = None  # KeystonePlayer 가 AudioDSP 를 넣어준다
 
         # 프로젝터 출력 (복제 창)
         self.output_window: QMainWindow | None = None
@@ -229,7 +232,13 @@ class ProjectorWindow(QMainWindow):
             self.on_volume_changed(value)
 
     def _apply_volume(self, value: int):
-        self.audio.setVolume(value / 100.0)
+        if self.dsp is not None and self.dsp.is_running():
+            # DSP 사용 중에는 컴프레서에 풀스케일로 넣고,
+            # 볼륨은 리미터 뒤 출력 게인으로 조절한다 (브라우저 소리에도 같이 적용됨)
+            self.audio.setVolume(1.0)
+            self.dsp.set_volume(value)
+        else:
+            self.audio.setVolume(value / 100.0)
         self.volume_label.setText(f"{value}%")
 
     def _refresh_screens(self):
@@ -424,6 +433,14 @@ class KeystonePlayer(QMainWindow):
         self.projector_window: ProjectorWindow | None = None
         self.playback_mode = "file"  # "file" or "browser"
 
+        # 사운드 보정 (볼륨 평준화 + 최대 출력 제한)
+        self.dsp = audio_dsp.AudioDSP(audio_dsp.default_storage_dir(), self)
+        self.dsp.set_preset(self._settings.get("audio_preset", audio_dsp.DEFAULT_PRESET))
+        self.dsp.set_ceiling_db(
+            self._settings.get("audio_ceiling", audio_dsp.DEFAULT_CEILING)
+        )
+        self.dsp.set_volume(self.volume_value)
+
         # mpv (파일 재생용)
         self.mpv_process: QProcess | None = None
         self.ipc_path = os.path.join(tempfile.gettempdir(), f"keystone-mpv-{os.getpid()}")
@@ -556,6 +573,44 @@ class KeystonePlayer(QMainWindow):
         aspect_layout.addWidget(btn_aspect_reset)
         layout.addWidget(aspect_group)
 
+        # --- 사운드 보정 ---
+        sound_group = QGroupBox("사운드 보정")
+        sound_layout = QVBoxLayout(sound_group)
+
+        dsp_row = QHBoxLayout()
+        self.dsp_check = QCheckBox("볼륨 평준화 (대화 크게 / 액션 작게)")
+        self.dsp_check.toggled.connect(self._on_dsp_toggled)
+        dsp_row.addWidget(self.dsp_check)
+        dsp_row.addStretch()
+        dsp_row.addWidget(QLabel("강도:"))
+        self.dsp_preset_combo = QComboBox()
+        for key, spec in audio_dsp.PRESETS.items():
+            self.dsp_preset_combo.addItem(spec[0], key)
+        self.dsp_preset_combo.currentIndexChanged.connect(self._on_dsp_preset_changed)
+        dsp_row.addWidget(self.dsp_preset_combo)
+        sound_layout.addLayout(dsp_row)
+
+        ceiling_row = QHBoxLayout()
+        ceiling_row.addWidget(QLabel("최대 출력 제한:"))
+        self.ceiling_slider = QSlider(Qt.Horizontal)
+        self.ceiling_slider.setRange(-20, 0)
+        self.ceiling_slider.setTickPosition(QSlider.TicksBelow)
+        self.ceiling_slider.setTickInterval(2)
+        self.ceiling_slider.valueChanged.connect(self._on_ceiling_changed)
+        ceiling_row.addWidget(self.ceiling_slider)
+        self.ceiling_label = QLabel()
+        self.ceiling_label.setFixedWidth(55)
+        self.ceiling_label.setAlignment(Qt.AlignCenter)
+        ceiling_row.addWidget(self.ceiling_label)
+        sound_layout.addLayout(ceiling_row)
+
+        self.dsp_status = QLabel()
+        self.dsp_status.setWordWrap(True)
+        sound_layout.addWidget(self.dsp_status)
+        layout.addWidget(sound_group)
+
+        self._init_sound_controls()
+
         # --- 재생 컨트롤 ---
         ctrl_group = QGroupBox("재생")
         ctrl_layout = QHBoxLayout(ctrl_group)
@@ -573,6 +628,69 @@ class KeystonePlayer(QMainWindow):
         self.status_label = QLabel("준비")
         self.status_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.status_label)
+
+    # ---- 사운드 보정 ----
+
+    def _init_sound_controls(self):
+        """저장된 값으로 위젯을 채운다 (시그널 없이)."""
+        preset = self._settings.get("audio_preset", audio_dsp.DEFAULT_PRESET)
+        idx = self.dsp_preset_combo.findData(preset)
+        if idx >= 0:
+            self.dsp_preset_combo.blockSignals(True)
+            self.dsp_preset_combo.setCurrentIndex(idx)
+            self.dsp_preset_combo.blockSignals(False)
+
+        ceiling = int(self._settings.get("audio_ceiling", audio_dsp.DEFAULT_CEILING))
+        self.ceiling_slider.blockSignals(True)
+        self.ceiling_slider.setValue(ceiling)
+        self.ceiling_slider.blockSignals(False)
+        self.ceiling_label.setText(f"{ceiling} dB")
+
+        problem = audio_dsp.check_requirements()
+        if problem:
+            self.dsp_check.setEnabled(False)
+            self.dsp_preset_combo.setEnabled(False)
+            self.ceiling_slider.setEnabled(False)
+            self.dsp_status.setText(f"사용 불가 — {problem}")
+            return
+
+        self.dsp_status.setText("꺼짐")
+        if self._settings.get("audio_dsp", False):
+            self.dsp_check.setChecked(True)  # _on_dsp_toggled 가 시작시킨다
+
+    def _on_dsp_toggled(self, checked: bool):
+        if checked:
+            error = self.dsp.start()
+            if error:
+                self.dsp_status.setText(f"시작 실패 — {error}")
+                self.dsp_check.blockSignals(True)
+                self.dsp_check.setChecked(False)
+                self.dsp_check.blockSignals(False)
+                return
+            self.dsp_status.setText(
+                "적용 중 — 이 앱의 소리만 처리합니다 (시스템 기본 출력은 그대로)"
+            )
+        else:
+            self.dsp.stop()
+            self.dsp_status.setText("꺼짐")
+
+        self._settings["audio_dsp"] = checked
+        save_settings(self._settings)
+        # 볼륨 적용 지점이 바뀌므로 다시 적용
+        if self.projector_window:
+            self.projector_window.set_volume(self.volume_value)
+
+    def _on_dsp_preset_changed(self, index: int):
+        preset = self.dsp_preset_combo.currentData()
+        self.dsp.set_preset(preset)
+        self._settings["audio_preset"] = preset
+        save_settings(self._settings)
+
+    def _on_ceiling_changed(self, value: int):
+        self.ceiling_label.setText(f"{value} dB")
+        self.dsp.set_ceiling_db(float(value))
+        self._settings["audio_ceiling"] = value
+        save_settings(self._settings)
 
     # ---- UI 이벤트 ----
 
@@ -625,6 +743,7 @@ class KeystonePlayer(QMainWindow):
             self.projector_window = ProjectorWindow()
             self.projector_window.on_closed = self._on_emulator_window_closed
             self.projector_window.on_volume_changed = self._on_volume_changed
+            self.projector_window.dsp = self.dsp
             self.projector_window.set_volume(self.volume_value)
 
         pw = self.projector_window
@@ -778,6 +897,7 @@ class KeystonePlayer(QMainWindow):
         if self.projector_window:
             self.projector_window.close()
             self.projector_window = None
+        self.dsp.stop()
         super().closeEvent(event)
 
 
