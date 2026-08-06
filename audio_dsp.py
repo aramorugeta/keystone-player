@@ -107,6 +107,7 @@ class AudioDSP(QObject):
         self._volume = 100
         self._moved: set[int] = set()
         self._net_target: tuple[str, int] | None = None
+        self._leveling = True
 
         # 새로 생긴 스트림을 주기적으로 DSP 싱크로 옮긴다
         self._move_timer = QTimer(self)
@@ -183,6 +184,22 @@ class AudioDSP(QObject):
 
     # ---- 파라미터 ----
 
+    def set_leveling(self, enabled: bool):
+        """볼륨 평준화 사용 여부. 폰 송출 중에는 이 값과 무관하게 꺼진다."""
+        enabled = bool(enabled)
+        if enabled == self._leveling:
+            return
+        self._leveling = enabled
+        self._restart_if_running()
+
+    def leveling_active(self) -> bool:
+        """실제로 압축이 걸리고 있는가.
+
+        폰으로 소리를 보낼 때는 이어폰으로 듣는 상황이라 평준화가 필요 없고,
+        원본 그대로 보내는 편이 낫다. 체크박스 상태는 로컬 재생용으로 유지된다.
+        """
+        return self._leveling and self._net_target is None
+
     def set_network_target(self, ip: str, port: int):
         """DSP 출력을 이 주소로 RTP 송출한다 (로컬 스피커 대신)."""
         target = (ip, int(port))
@@ -229,15 +246,18 @@ class AudioDSP(QObject):
     def apply_params(self):
         if not self.is_running():
             return
-        _, thr, ratio, attack, release, makeup = PRESETS[self._preset]
-        params = [
-            f'"comp:Threshold level (dB)"', f"{thr}",
-            f'"comp:Ratio (1:n)"', f"{ratio}",
-            f'"comp:Attack time (ms)"', f"{attack}",
-            f'"comp:Release time (ms)"', f"{release}",
-            f'"comp:Makeup gain (dB)"', f"{makeup}",
-            f'"lim:Limit (dB)"', f"{self._ceiling_db}",
-        ]
+        params = []
+        if self.leveling_active():
+            # 평준화가 꺼진 그래프에는 comp/lim 노드가 아예 없으므로 보내면 안 된다
+            _, thr, ratio, attack, release, makeup = PRESETS[self._preset]
+            params = [
+                '"comp:Threshold level (dB)"', f"{thr}",
+                '"comp:Ratio (1:n)"', f"{ratio}",
+                '"comp:Attack time (ms)"', f"{attack}",
+                '"comp:Release time (ms)"', f"{release}",
+                '"comp:Makeup gain (dB)"', f"{makeup}",
+                '"lim:Limit (dB)"', f"{self._ceiling_db}",
+            ]
         self._set_props(params + self._volume_params())
 
     def _set_props(self, params: list):
@@ -369,24 +389,24 @@ class AudioDSP(QObject):
                 node.passive = true
                 audio.position = [ FL FR ]"""
 
-    def _write_conf(self):
-        os.makedirs(self.storage_dir, exist_ok=True)
-        _, thr, ratio, attack, release, makeup = PRESETS[self._preset]
+    def _filter_graph(self) -> str:
+        """평준화가 켜져 있으면 컴프레서+리미터+볼륨, 아니면 볼륨 게인만."""
         gain = (self._volume / 100.0) ** 3
-        conf = f"""# Keystone Player 사운드 DSP (자동 생성 - 직접 편집하지 마세요)
-context.properties = {{ log.level = 0 }}
-context.spa-libs = {{ audio.convert.* = audioconvert/libspa-audioconvert }}
-context.modules = [
-    {{ name = libpipewire-module-rt args = {{}} flags = [ ifexists nofail ] }}
-    {{ name = libpipewire-module-protocol-native }}
-    {{ name = libpipewire-module-client-node }}
-    {{ name = libpipewire-module-adapter }}
-{self._rtp_module()}    {{ name = libpipewire-module-filter-chain
-        args = {{
-            node.description = "{SINK_DESC}"
-            media.name       = "{SINK_DESC}"
-            filter.graph = {{
-                nodes = [
+        vol_nodes = f"""                    {{ type = builtin name = vol_l label = linear
+                       control = {{ "Mult" = {gain:.6f} "Add" = 0.0 }} }}
+                    {{ type = builtin name = vol_r label = linear
+                       control = {{ "Mult" = {gain:.6f} "Add" = 0.0 }} }}"""
+
+        if not self.leveling_active():
+            # 순수 게인만 통과. 볼륨 100% 면 ×1.0 이라 원본 그대로 나간다.
+            return f"""                nodes = [
+{vol_nodes}
+                ]
+                inputs  = [ "vol_l:In" "vol_r:In" ]
+                outputs = [ "vol_l:Out" "vol_r:Out" ]"""
+
+        _, thr, ratio, attack, release, makeup = PRESETS[self._preset]
+        return f"""                nodes = [
                     {{
                         type   = ladspa
                         name   = comp
@@ -413,10 +433,7 @@ context.modules = [
                             "Release time (s)"  = 0.25
                         }}
                     }}
-                    {{ type = builtin name = vol_l label = linear
-                       control = {{ "Mult" = {gain:.6f} "Add" = 0.0 }} }}
-                    {{ type = builtin name = vol_r label = linear
-                       control = {{ "Mult" = {gain:.6f} "Add" = 0.0 }} }}
+{vol_nodes}
                 ]
                 links = [
                     {{ output = "comp:Left output"  input = "lim:Input 1" }}
@@ -425,7 +442,24 @@ context.modules = [
                     {{ output = "lim:Output 2"      input = "vol_r:In" }}
                 ]
                 inputs  = [ "comp:Left input" "comp:Right input" ]
-                outputs = [ "vol_l:Out" "vol_r:Out" ]
+                outputs = [ "vol_l:Out" "vol_r:Out" ]"""
+
+    def _write_conf(self):
+        os.makedirs(self.storage_dir, exist_ok=True)
+        conf = f"""# Keystone Player 사운드 DSP (자동 생성 - 직접 편집하지 마세요)
+context.properties = {{ log.level = 0 }}
+context.spa-libs = {{ audio.convert.* = audioconvert/libspa-audioconvert }}
+context.modules = [
+    {{ name = libpipewire-module-rt args = {{}} flags = [ ifexists nofail ] }}
+    {{ name = libpipewire-module-protocol-native }}
+    {{ name = libpipewire-module-client-node }}
+    {{ name = libpipewire-module-adapter }}
+{self._rtp_module()}    {{ name = libpipewire-module-filter-chain
+        args = {{
+            node.description = "{SINK_DESC}"
+            media.name       = "{SINK_DESC}"
+            filter.graph = {{
+{self._filter_graph()}
             }}
             audio.channels = 2
             audio.position = [ FL FR ]

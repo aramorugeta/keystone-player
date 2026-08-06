@@ -760,7 +760,15 @@ class KeystonePlayer(QMainWindow):
             self.net_check.setChecked(True)
 
     def _on_dsp_toggled(self, checked: bool):
-        if checked:
+        self.dsp.set_leveling(checked)
+        self._settings["audio_dsp"] = checked
+        save_settings(self._settings)
+        self._sync_dsp()
+
+    def _sync_dsp(self):
+        """평준화 또는 폰 송출 중 하나라도 필요하면 DSP 체인을 띄운다."""
+        needed = self.dsp_check.isChecked() or self.dsp.network_target() is not None
+        if needed and not self.dsp.is_running():
             error = self.dsp.start()
             if error:
                 self.dsp_status.setText(f"시작 실패 — {error}")
@@ -768,15 +776,20 @@ class KeystonePlayer(QMainWindow):
                 self.dsp_check.setChecked(False)
                 self.dsp_check.blockSignals(False)
                 return
+        elif not needed and self.dsp.is_running():
+            self.dsp.stop()
+
+        if not self.dsp.is_running():
+            self.dsp_status.setText("꺼짐")
+        elif self.dsp.leveling_active():
             self.dsp_status.setText(
                 "적용 중 — 이 앱의 소리만 처리합니다 (시스템 기본 출력은 그대로)"
             )
         else:
-            self.dsp.stop()
-            self.dsp_status.setText("꺼짐")
+            self.dsp_status.setText(
+                "폰 송출 중 — 평준화는 자동으로 꺼집니다 (이어폰에는 원본 그대로가 낫습니다)"
+            )
 
-        self._settings["audio_dsp"] = checked
-        save_settings(self._settings)
         # 볼륨 적용 지점이 바뀌므로 다시 적용
         if self.projector_window:
             self.projector_window.set_volume(self.volume_value)
@@ -818,15 +831,13 @@ class KeystonePlayer(QMainWindow):
 
     def _on_net_toggled(self, checked: bool):
         if checked:
-            # RTP 송출은 DSP 체인 안에서 만들어지므로 사운드 보정이 켜져 있어야 한다
-            if not self.dsp_check.isChecked():
-                if not self.dsp_check.isEnabled():
-                    self.net_status.setText("사용 불가 — 사운드 보정을 먼저 쓸 수 있어야 합니다")
-                    self.net_check.blockSignals(True)
-                    self.net_check.setChecked(False)
-                    self.net_check.blockSignals(False)
-                    return
-                self.dsp_check.setChecked(True)
+            # RTP 송출은 DSP 체인 안에서 만들어지므로 플러그인은 있어야 한다
+            if not self.dsp_check.isEnabled():
+                self.net_status.setText("사용 불가 — PipeWire/LADSPA 플러그인이 필요합니다")
+                self.net_check.blockSignals(True)
+                self.net_check.setChecked(False)
+                self.net_check.blockSignals(False)
+                return
 
             error = self.control.start()
             if error:
@@ -857,9 +868,11 @@ class KeystonePlayer(QMainWindow):
 
     def _on_phone_connected(self, ip: str):
         self.dsp.set_network_target(ip, net_audio.AUDIO_PORT)
+        self._sync_dsp()
 
     def _on_phone_disconnected(self):
         self.dsp.clear_network_target()
+        self._sync_dsp()
         if self.net_auto_check.isChecked():
             self.delay_slider.setValue(0)
 
