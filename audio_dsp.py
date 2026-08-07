@@ -24,7 +24,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QObject, QProcess, QTimer
 
 PR_SET_PDEATHSIG = 1
 
@@ -132,11 +132,13 @@ class AudioDSP(QObject):
         self._volume = 100
         self._moved: set[int] = set()
         self._net_target: tuple[str, int] | None = None
+        self._dump_proc: QProcess | None = None
+        self._dump_started = 0.0
         self._leveling = True
 
         # 새로 생긴 스트림을 주기적으로 DSP 싱크로 옮긴다
         self._move_timer = QTimer(self)
-        self._move_timer.timeout.connect(self._move_streams)
+        self._move_timer.timeout.connect(self._poll_streams)
 
     # ---- 상태 ----
 
@@ -181,12 +183,15 @@ class AudioDSP(QObject):
             return "DSP 싱크를 찾을 수 없습니다"
 
         self.apply_params()
-        self._move_streams()
+        self._poll_streams()
         self._move_timer.start(1000)
         return None
 
     def stop(self):
         self._move_timer.stop()
+        if self._dump_proc is not None:
+            self._dump_proc.kill()
+            self._dump_proc = None
         # 옮겨놨던 스트림은 기본 출력으로 되돌린다
         for node_id in self._moved:
             self._set_target(node_id, None)
@@ -309,13 +314,19 @@ class AudioDSP(QObject):
         if self._sink_id is None:
             return
         payload = "{ params = [ " + " ".join(params) + " ] }"
-        try:
-            subprocess.run(
-                ["pw-cli", "set-param", str(self._sink_id), "Props", payload],
-                capture_output=True, timeout=3,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        # 볼륨 슬라이더를 끌면 값마다 호출된다. 동기로 돌리면 그때마다 화면이 걸린다.
+        self._run_detached(["pw-cli", "set-param", str(self._sink_id), "Props", payload])
+
+    def _run_detached(self, cmd: list):
+        """결과를 기다리지 않는 짧은 명령. GUI 스레드를 막지 않는다.
+
+        Qt 가 종료를 수습하므로 좀비가 남지 않고, 출력은 버려서 터미널을 더럽히지 않는다.
+        """
+        proc = QProcess(self)
+        proc.setStandardOutputFile(QProcess.nullDevice())
+        proc.setStandardErrorFile(QProcess.nullDevice())
+        proc.finished.connect(lambda *_: proc.deleteLater())
+        proc.start(cmd[0], cmd[1:])
 
     # ---- PipeWire 조회/라우팅 ----
 
@@ -336,17 +347,54 @@ class AudioDSP(QObject):
                 return obj.get("id")
         return None
 
-    def _move_streams(self):
+    def _poll_streams(self):
+        """새 스트림을 찾기 위해 그래프를 훑는다 — 반드시 비동기로.
+
+        pw-dump 는 이 기계에서 한 번에 40~60ms 가 걸린다. GUI 스레드에서 동기로
+        돌리면 매초 그만큼 멈추고, 영상 지연 큐를 비우는 타이머까지 같이 밀려서
+        재생이 눈에 띄게 버벅인다.
+        """
+        if not self.is_running():
+            return
+        if self._dump_proc is not None:
+            # 앞선 덤프가 끝나지 않았다. 한참 걸리면 버리고 다시 시작한다.
+            if self._dump_proc.state() != QProcess.NotRunning and time.monotonic() - self._dump_started < 5:
+                return
+            self._dump_proc.kill()
+            self._dump_proc = None
+        proc = QProcess(self)
+        proc.finished.connect(lambda *_: self._on_dump_ready(proc))
+        proc.errorOccurred.connect(lambda *_: self._on_dump_ready(proc))
+        self._dump_proc = proc
+        self._dump_started = time.monotonic()
+        proc.start("pw-dump", [])
+
+    def _on_dump_ready(self, proc: QProcess):
+        if self._dump_proc is not proc:
+            return
+        self._dump_proc = None
+        raw = bytes(proc.readAllStandardOutput())
+        proc.deleteLater()
+        try:
+            dump = json.loads(raw) if raw else []
+        except json.JSONDecodeError:
+            return
+        self._move_streams(dump)
+
+    def _move_streams(self, dump: list):
         """이 앱(과 자식 프로세스)이 만든 오디오 스트림만 DSP 싱크로 옮긴다."""
         if not self.is_running():
             return
         if self._sink_id is None:
-            self._sink_id = self._find_sink_id()
+            for obj in dump:
+                props = (obj.get("info") or {}).get("props") or {}
+                if props.get("node.name") == SINK_NAME:
+                    self._sink_id = obj.get("id")
+                    break
             if self._sink_id is None:
                 return
 
         pids = _descendant_pids(os.getpid())
-        dump = self._pw_dump()
 
         # 클라이언트 → pid (네이티브 PipeWire 클라이언트는 노드에 pid 가 없다)
         client_pid: dict[int, int] = {}
@@ -390,10 +438,7 @@ class AudioDSP(QObject):
             return
         cmd = ["pw-metadata", str(node_id), "target.object"]
         cmd += [target] if target else ["null"]
-        try:
-            subprocess.run(cmd, capture_output=True, timeout=3)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        self._run_detached(cmd)
 
     # ---- 설정 파일 ----
 
