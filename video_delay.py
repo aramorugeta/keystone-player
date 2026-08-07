@@ -19,7 +19,10 @@ from collections import deque
 from PySide6.QtCore import Qt, QElapsedTimer, QObject, QTimer
 from PySide6.QtMultimedia import QVideoSink
 
-MAX_DELAY_MS = 500
+# 폰에 블루투스 이어폰을 물리면 A2DP 지연 150~250ms 가 통째로 더해진다.
+# 500ms 로는 여유가 없어서 상한에 걸려 잘리고, 그러면 립싱크가 조용히 깨진다.
+# 30fps 기준 24 프레임을 들고 있게 되는데 시스템 메모리 프레임이라 부담은 적다.
+MAX_DELAY_MS = 800
 FLUSH_INTERVAL_MS = 2
 
 

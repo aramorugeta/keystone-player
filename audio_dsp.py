@@ -325,7 +325,9 @@ class AudioDSP(QObject):
         proc = QProcess(self)
         proc.setStandardOutputFile(QProcess.nullDevice())
         proc.setStandardErrorFile(QProcess.nullDevice())
-        proc.finished.connect(lambda *_: proc.deleteLater())
+        # 파이썬 람다로 감싸면 C++ 객체가 먼저 지워진 뒤 호출돼 예외가 난다.
+        # 슬롯을 직접 연결하면 Qt 가 수명을 알아서 맞춘다.
+        proc.finished.connect(proc.deleteLater)
         proc.start(cmd[0], cmd[1:])
 
     # ---- PipeWire 조회/라우팅 ----
@@ -374,6 +376,9 @@ class AudioDSP(QObject):
             return
         self._dump_proc = None
         raw = bytes(proc.readAllStandardOutput())
+        # 두 시그널이 다 올 수 있다. 끊어두지 않으면 지워진 객체로 다시 들어온다.
+        proc.finished.disconnect()
+        proc.errorOccurred.disconnect()
         proc.deleteLater()
         try:
             dump = json.loads(raw) if raw else []
