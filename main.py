@@ -670,20 +670,6 @@ class KeystonePlayer(QMainWindow):
         net_row.addWidget(self.net_auto_check)
         net_layout.addLayout(net_row)
 
-        boost_row = QHBoxLayout()
-        boost_row.addWidget(QLabel("이어폰 게인:"))
-        self.net_boost_spin = QSpinBox()
-        self.net_boost_spin.setRange(0, int(audio_dsp.MAX_BOOST_DB))
-        self.net_boost_spin.setSuffix(" dB")
-        self.net_boost_spin.setToolTip(
-            "폰 송출 중에는 평준화가 빠지면서 그만큼 조용해진다. 그 몫을 되돌리는 값"
-        )
-        self.net_boost_spin.valueChanged.connect(self._on_net_boost_changed)
-        boost_row.addWidget(self.net_boost_spin)
-        boost_row.addWidget(QLabel("(클리핑은 리미터가 막음)"))
-        boost_row.addStretch()
-        net_layout.addLayout(boost_row)
-
         trim_row = QHBoxLayout()
         trim_row.addWidget(QLabel("수동 보정:"))
         self.net_offset_spin = QSpinBox()
@@ -764,12 +750,6 @@ class KeystonePlayer(QMainWindow):
         self.net_auto_check.blockSignals(True)
         self.net_auto_check.setChecked(self._settings.get("net_auto_delay", True))
         self.net_auto_check.blockSignals(False)
-
-        boost = self._settings.get("net_boost_db", audio_dsp.DEFAULT_BOOST_DB)
-        self.net_boost_spin.blockSignals(True)
-        self.net_boost_spin.setValue(int(boost))
-        self.net_boost_spin.blockSignals(False)
-        self.dsp.set_boost_db(boost)
 
         # 폰이 알 수 없는 PC 쪽 송출 버퍼를 총합에 넣어준다
         self.control.set_pc_latency(audio_dsp.RTP_LATENCY_MS)
@@ -880,11 +860,6 @@ class KeystonePlayer(QMainWindow):
 
     def _on_net_auto_toggled(self, checked: bool):
         self._settings["net_auto_delay"] = checked
-        save_settings(self._settings)
-
-    def _on_net_boost_changed(self, value: int):
-        self.dsp.set_boost_db(value)
-        self._settings["net_boost_db"] = value
         save_settings(self._settings)
 
     def _on_net_offset_changed(self, value: int):

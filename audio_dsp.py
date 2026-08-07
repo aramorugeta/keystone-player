@@ -59,9 +59,8 @@ RTP_PACKET_MS = 5
 RTP_LATENCY_MS = 20  # PC 쪽 송출 버퍼. 지터 흡수는 폰이 담당한다
 
 # 폰 송출 때는 평준화를 빼기 때문에 컴프레서의 makeup gain 도 같이 사라진다.
-# 그만큼 조용해지므로 게인으로 되돌려준다.
-DEFAULT_BOOST_DB = 15.0
-MAX_BOOST_DB = 24.0
+# 그만큼 조용해지므로 고정 게인으로 되돌려준다. 미세 조정은 폰에서 한다.
+RTP_BOOST_DB = 15.0
 # 게인을 올리면 큰 소리에서 0 dBFS 를 넘어 깨진다. 이 리미터는 평준화용이 아니라
 # 그 피크만 막는 안전장치라서, 넘지 않는 구간에서는 아무 일도 하지 않는다.
 RTP_SAFETY_CEILING_DB = -0.5
@@ -134,7 +133,6 @@ class AudioDSP(QObject):
         self._moved: set[int] = set()
         self._net_target: tuple[str, int] | None = None
         self._leveling = True
-        self._boost_db = DEFAULT_BOOST_DB
 
         # 새로 생긴 스트림을 주기적으로 DSP 싱크로 옮긴다
         self._move_timer = QTimer(self)
@@ -274,23 +272,15 @@ class AudioDSP(QObject):
         if self.is_running():
             self._set_props(self._volume_params())
 
-    def set_boost_db(self, value: float):
-        """폰 송출 때만 걸리는 추가 게인. 로컬 출력에는 영향이 없다."""
-        value = max(0.0, min(MAX_BOOST_DB, float(value)))
-        if value == self._boost_db:
-            return
-        self._boost_db = value
-        if self.is_running():
-            self._set_props(self._volume_params())
-
-    def boost_db(self) -> float:
-        return self._boost_db
-
     def _output_gain(self) -> float:
-        gain = (self._volume / 100.0) ** 3  # 체감에 맞춘 3제곱 커브
+        """폰 송출 중에는 고정 레벨로 내보낸다.
+
+        볼륨은 폰에서 조절하므로 PC 쪽 슬라이더가 끼어들 이유가 없다.
+        평준화가 빠지면서 사라진 makeup gain 만큼을 게인으로 되돌려 보낸다.
+        """
         if self._net_target is not None:
-            gain *= 10.0 ** (self._boost_db / 20.0)
-        return gain
+            return 10.0 ** (RTP_BOOST_DB / 20.0)
+        return (self._volume / 100.0) ** 3  # 체감에 맞춘 3제곱 커브
 
     def _volume_params(self) -> list:
         gain = self._output_gain()
