@@ -353,7 +353,7 @@ class ReceiverService : Service() {
         return Notification.Builder(this, NOTIF_CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(openIntent)
             .setOngoing(true)
             .addAction(

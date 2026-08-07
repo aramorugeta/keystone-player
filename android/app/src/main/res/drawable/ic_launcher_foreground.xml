@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  프로젝터 아이콘 (icon.svg 이식).
+  원본 SVG viewBox 128x128 → 여기 viewport 108x108 (adaptive 아이콘 표준).
+
+  스케일 0.5, 이동 (22, 24.5):
+    원본 콘텐츠 중심 (64, 59) → 아이콘 중심 (54, 54)
+    스트로크 포함 최외곽 (5.5, 8.5)~(122.5, 109.5) → (24.75, 28.75)~(83.25, 79.25)
+    → 108 캔버스의 안전 사각형(18~90) 안에 넉넉히 들어감.
+  가장 엄격한 원형 마스크(반경 36)에서도 잘림 최소화.
+
+  색상/굵기/좌표는 원본 SVG 그대로 유지.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="0.5"
+        android:scaleY="0.5"
+        android:translateX="22"
+        android:translateY="24.5">
+
+        <!-- 천장 레일 -->
+        <path
+            android:strokeColor="#0050B5"
+            android:strokeWidth="7"
+            android:strokeLineCap="round"
+            android:pathData="M30,12 H98" />
+
+        <!-- 마운트 -->
+        <path
+            android:fillColor="#52A0FF"
+            android:strokeColor="#0050B5"
+            android:strokeWidth="7"
+            android:strokeLineJoin="round"
+            android:pathData="M56,16 H72 V30 H56 Z" />
+
+        <!-- 받침 (rx=6 rounded rect) -->
+        <path
+            android:fillColor="#52A0FF"
+            android:strokeColor="#0050B5"
+            android:strokeWidth="7"
+            android:strokeLineJoin="round"
+            android:pathData="M25,88 H103 A6,6 0 0 1 109,94 V100 A6,6 0 0 1 103,106 H25 A6,6 0 0 1 19,100 V94 A6,6 0 0 1 25,88 Z" />
+
+        <!-- 본체 (rx=10 rounded rect) -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:strokeColor="#0050B5"
+            android:strokeWidth="7"
+            android:strokeLineJoin="round"
+            android:pathData="M19,34 H109 A10,10 0 0 1 119,44 V84 A10,10 0 0 1 109,94 H19 A10,10 0 0 1 9,84 V44 A10,10 0 0 1 19,34 Z" />
+
+        <!-- 렌즈 바깥 원 (cx=45 cy=64 r=25) -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:strokeColor="#0050B5"
+            android:strokeWidth="7"
+            android:pathData="M20,64 A25,25 0 1 0 70,64 A25,25 0 1 0 20,64 Z" />
+
+        <!-- 렌즈 안쪽 원 (cx=45 cy=64 r=15) -->
+        <path
+            android:fillColor="#52A0FF"
+            android:strokeColor="#0050B5"
+            android:strokeWidth="7"
+            android:pathData="M30,64 A15,15 0 1 0 60,64 A15,15 0 1 0 30,64 Z" />
+
+        <!-- 조작부 (두 줄) -->
+        <path
+            android:strokeColor="#0050B5"
+            android:strokeWidth="7"
+            android:strokeLineCap="round"
+            android:pathData="M84,54 H106" />
+        <path
+            android:strokeColor="#0050B5"
+            android:strokeWidth="7"
+            android:strokeLineCap="round"
+            android:pathData="M84,74 H106" />
+    </group>
+</vector>

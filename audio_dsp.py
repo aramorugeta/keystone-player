@@ -15,13 +15,31 @@ Keystone Player 가 내는 오디오 스트림만 그 싱크로 옮겨서 처리
 앱이 종료되면 가상 싱크도 같이 사라지고 스트림은 기본 출력으로 되돌아간다.
 """
 
+import ctypes
 import json
 import os
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QProcess, QTimer
+from PySide6.QtCore import QObject, QTimer
+
+PR_SET_PDEATHSIG = 1
+
+
+def _die_with_parent():
+    """부모가 사라지면 커널이 이 프로세스를 죽이도록 표시한다.
+
+    앱이 kill -9 로 죽거나 크래시하면 Qt 의 정리 코드가 돌지 않아 헬퍼가 살아남는다.
+    그러면 유령 싱크가 이름을 계속 점유한 채 스피커로 소리를 흘린다.
+    """
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+    except OSError:
+        pass
+
 
 LADSPA_DIRS = ["/usr/lib64/ladspa", "/usr/lib/ladspa", "/usr/local/lib/ladspa"]
 COMP_PLUGIN = "sc4_1882"
@@ -39,6 +57,14 @@ RTP_RATE = 48000
 RTP_CHANNELS = 2
 RTP_PACKET_MS = 5
 RTP_LATENCY_MS = 20  # PC 쪽 송출 버퍼. 지터 흡수는 폰이 담당한다
+
+# 폰 송출 때는 평준화를 빼기 때문에 컴프레서의 makeup gain 도 같이 사라진다.
+# 그만큼 조용해지므로 게인으로 되돌려준다.
+DEFAULT_BOOST_DB = 15.0
+MAX_BOOST_DB = 24.0
+# 게인을 올리면 큰 소리에서 0 dBFS 를 넘어 깨진다. 이 리미터는 평준화용이 아니라
+# 그 피크만 막는 안전장치라서, 넘지 않는 구간에서는 아무 일도 하지 않는다.
+RTP_SAFETY_CEILING_DB = -0.5
 
 # 강도 프리셋: (threshold dB, ratio, attack ms, release ms, makeup gain dB)
 PRESETS = {
@@ -100,7 +126,7 @@ class AudioDSP(QObject):
         super().__init__(parent)
         self.storage_dir = storage_dir
         self.conf_path = os.path.join(storage_dir, "audio-dsp.conf")
-        self.process: QProcess | None = None
+        self.process: subprocess.Popen | None = None
         self._sink_id: int | None = None
         self._preset = DEFAULT_PRESET
         self._ceiling_db = DEFAULT_CEILING
@@ -108,6 +134,7 @@ class AudioDSP(QObject):
         self._moved: set[int] = set()
         self._net_target: tuple[str, int] | None = None
         self._leveling = True
+        self._boost_db = DEFAULT_BOOST_DB
 
         # 새로 생긴 스트림을 주기적으로 DSP 싱크로 옮긴다
         self._move_timer = QTimer(self)
@@ -116,7 +143,7 @@ class AudioDSP(QObject):
     # ---- 상태 ----
 
     def is_running(self) -> bool:
-        return self.process is not None and self.process.state() != QProcess.NotRunning
+        return self.process is not None and self.process.poll() is None
 
     # ---- 시작/정지 ----
 
@@ -131,22 +158,25 @@ class AudioDSP(QObject):
         self._kill_stale()
         self._write_conf()
 
-        self.process = QProcess(self)
-        self.process.setProcessChannelMode(QProcess.MergedChannels)
-        self.process.start("pipewire", ["-c", self.conf_path])
-        if not self.process.waitForStarted(3000):
+        try:
+            self.process = subprocess.Popen(
+                ["pipewire", "-c", self.conf_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                preexec_fn=_die_with_parent,
+            )
+        except OSError as exc:
             self.process = None
-            return "pipewire 프로세스를 시작하지 못했습니다"
+            return f"pipewire 프로세스를 시작하지 못했습니다: {exc}"
 
         # 싱크가 그래프에 등록될 때까지 잠깐 기다린다
         for _ in range(30):
             self._sink_id = self._find_sink_id()
             if self._sink_id is not None:
                 break
-            if self.process.waitForFinished(100):
-                out = bytes(self.process.readAll()).decode(errors="replace")
+            if self.process.poll() is not None:
                 self.process = None
-                return f"DSP 싱크 생성 실패: {out.strip().splitlines()[-1] if out.strip() else '알 수 없음'}"
+                return "DSP 싱크 생성 실패 (pipewire 가 곧바로 종료됨)"
+            time.sleep(0.1)
 
         if self._sink_id is None:
             self.stop()
@@ -164,11 +194,16 @@ class AudioDSP(QObject):
             self._set_target(node_id, None)
         self._moved.clear()
         if self.process is not None:
-            if self.process.state() != QProcess.NotRunning:
+            if self.process.poll() is None:
                 self.process.terminate()
-                if not self.process.waitForFinished(2000):
+                try:
+                    self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
                     self.process.kill()
-                    self.process.waitForFinished(1000)
+                    try:
+                        self.process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
             self.process = None
         self._sink_id = None
 
@@ -239,8 +274,26 @@ class AudioDSP(QObject):
         if self.is_running():
             self._set_props(self._volume_params())
 
-    def _volume_params(self) -> list:
+    def set_boost_db(self, value: float):
+        """폰 송출 때만 걸리는 추가 게인. 로컬 출력에는 영향이 없다."""
+        value = max(0.0, min(MAX_BOOST_DB, float(value)))
+        if value == self._boost_db:
+            return
+        self._boost_db = value
+        if self.is_running():
+            self._set_props(self._volume_params())
+
+    def boost_db(self) -> float:
+        return self._boost_db
+
+    def _output_gain(self) -> float:
         gain = (self._volume / 100.0) ** 3  # 체감에 맞춘 3제곱 커브
+        if self._net_target is not None:
+            gain *= 10.0 ** (self._boost_db / 20.0)
+        return gain
+
+    def _volume_params(self) -> list:
+        gain = self._output_gain()
         return ['"vol_l:Mult"', f"{gain:.6f}", '"vol_r:Mult"', f"{gain:.6f}"]
 
     def apply_params(self):
@@ -248,7 +301,7 @@ class AudioDSP(QObject):
             return
         params = []
         if self.leveling_active():
-            # 평준화가 꺼진 그래프에는 comp/lim 노드가 아예 없으므로 보내면 안 된다
+            # 평준화가 꺼진 그래프에는 comp 노드가 아예 없으므로 보내면 안 된다
             _, thr, ratio, attack, release, makeup = PRESETS[self._preset]
             params = [
                 '"comp:Threshold level (dB)"', f"{thr}",
@@ -258,6 +311,8 @@ class AudioDSP(QObject):
                 '"comp:Makeup gain (dB)"', f"{makeup}",
                 '"lim:Limit (dB)"', f"{self._ceiling_db}",
             ]
+        elif self._net_target is not None:
+            params = ['"lim:Limit (dB)"', f"{RTP_SAFETY_CEILING_DB}"]
         self._set_props(params + self._volume_params())
 
     def _set_props(self, params: list):
@@ -389,21 +444,39 @@ class AudioDSP(QObject):
                 node.passive = true
                 audio.position = [ FL FR ]"""
 
+    def _limiter_node(self, ceiling_db: float) -> str:
+        return f"""                    {{
+                        type   = ladspa
+                        name   = lim
+                        plugin = {LIMIT_PLUGIN}
+                        label  = {LIMIT_LABEL}
+                        control = {{
+                            "Input gain (dB)"   = 0.0
+                            "Limit (dB)"        = {ceiling_db}
+                            "Release time (s)"  = 0.25
+                        }}
+                    }}"""
+
     def _filter_graph(self) -> str:
         """평준화가 켜져 있으면 컴프레서+리미터+볼륨, 아니면 볼륨 게인만."""
-        gain = (self._volume / 100.0) ** 3
+        gain = self._output_gain()
         vol_nodes = f"""                    {{ type = builtin name = vol_l label = linear
                        control = {{ "Mult" = {gain:.6f} "Add" = 0.0 }} }}
                     {{ type = builtin name = vol_r label = linear
                        control = {{ "Mult" = {gain:.6f} "Add" = 0.0 }} }}"""
 
         if not self.leveling_active():
-            # 순수 게인만 통과. 볼륨 100% 면 ×1.0 이라 원본 그대로 나간다.
+            # 폰 송출: 게인 → 클리핑 방지 리미터. 압축은 하지 않는다.
             return f"""                nodes = [
 {vol_nodes}
+{self._limiter_node(RTP_SAFETY_CEILING_DB)}
+                ]
+                links = [
+                    {{ output = "vol_l:Out" input = "lim:Input 1" }}
+                    {{ output = "vol_r:Out" input = "lim:Input 2" }}
                 ]
                 inputs  = [ "vol_l:In" "vol_r:In" ]
-                outputs = [ "vol_l:Out" "vol_r:Out" ]"""
+                outputs = [ "lim:Output 1" "lim:Output 2" ]"""
 
         _, thr, ratio, attack, release, makeup = PRESETS[self._preset]
         return f"""                nodes = [
@@ -422,17 +495,7 @@ class AudioDSP(QObject):
                             "Makeup gain (dB)"     = {makeup}
                         }}
                     }}
-                    {{
-                        type   = ladspa
-                        name   = lim
-                        plugin = {LIMIT_PLUGIN}
-                        label  = {LIMIT_LABEL}
-                        control = {{
-                            "Input gain (dB)"   = 0.0
-                            "Limit (dB)"        = {self._ceiling_db}
-                            "Release time (s)"  = 0.25
-                        }}
-                    }}
+{self._limiter_node(self._ceiling_db)}
 {vol_nodes}
                 ]
                 links = [
